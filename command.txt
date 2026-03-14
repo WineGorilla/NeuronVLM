@@ -1,0 +1,21 @@
+# 生成训练数据
+python scripts/build_data.py \
+    --anno data/annotations/llava_instruct_150k.json \
+    --imgs data/images/train2014 \
+    --max 1000
+
+# 训练SAE
+python -m src.train
+
+# 构建feature缓存 + 标注
+python scripts/interpret.py --layer 8
+python scripts/interpret.py --layer 24
+
+# 查看标注
+python scripts/explore.py --layer 8 --show_labels
+
+# 可视化某个feature
+python scripts/explore.py --layer 8 --feature 100
+
+# 单张图热图
+python scripts/visualize.py --image data/images/train2014/COCO_train2014_000000000009.jpg --layer 8

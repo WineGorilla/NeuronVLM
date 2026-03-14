@@ -1,0 +1,9 @@
+torch
+torchvision
+transformers
+qwen-vl-utils
+anthropic
+opencv-python
+matplotlib
+numpy
+anthropic

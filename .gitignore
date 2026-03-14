@@ -1,0 +1,27 @@
+# datasets
+/data/
+
+# outputs / training
+/outputs/
+/results/
+/checkpoints/
+/logs/
+
+# python
+*.pyc
+*.pyo
+*.pyd
+__pycache__/
+
+# environments
+.env
+venv/
+.venv/
+env/
+
+# editors
+.vscode/
+.idea/
+
+# huggingface cache
+.cache/
