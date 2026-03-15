@@ -54,55 +54,40 @@ class FeatureRouter(nn.Module):
 
     def forward(
         self,
-        question_vec:   torch.Tensor,   # (hidden_dim,) 或 (batch, hidden_dim)
-        z:              torch.Tensor,   # (num_tokens, latent_dim)
-        decoder_weight: torch.Tensor,   # (hidden_dim, latent_dim) = decoder.weight.T
+        question_vec:   torch.Tensor,
+        z:              torch.Tensor,
+        decoder_weight: torch.Tensor,
     ) -> torch.Tensor:
-        """
-        Returns:
-            alpha: (num_tokens, latent_dim)
-                   已激活的 top-k feature 被增强，其余保持 1.0
-        """
+        device = z.device
+        dtype  = z.dtype
+
         if question_vec.dim() == 1:
-            question_vec = question_vec.unsqueeze(0)   # (1, hidden_dim)
+            question_vec = question_vec.unsqueeze(0)
 
-        # 问题向量投影
-        q = self.query_proj(question_vec.float())      # (1, hidden_dim)
+        # 统一设备
+        question_vec   = question_vec.to(device)
+        decoder_weight = decoder_weight.to(device)
 
-        # 与 decoder weight 做内积，得到每个 feature 的相关性分数
-        # decoder_weight: (hidden_dim, latent_dim)
-        # score[i] = q · decoder_weight[:, i]  =  问题语义与 feature i 的相似度
-        scores = torch.matmul(q, decoder_weight.float())   # (1, latent_dim)
-        scores = scores.squeeze(0)                          # (latent_dim,)
+        q      = self.query_proj(question_vec.float())
+        scores = torch.matmul(q, decoder_weight.float()).squeeze(0)  # (latent_dim,)
 
-        # 只对已激活的 feature 打分（dead feature 不参与）
-        # 取所有 token 的激活均值作为 feature 是否活跃的判断
-        active_mask = (z > 0).float().mean(dim=0)      # (latent_dim,)  0~1
+        active_mask = (z > 0).float().mean(dim=0)
+        scores      = scores + (1 - (active_mask > 0).float()) * (-1e9)
 
-        # 用 active_mask 过滤分数，非激活 feature 分数置为 -inf
-        scores = scores + (1 - (active_mask > 0).float()) * (-1e9)
+        k = min(self.topk_route, int((active_mask > 0).sum().item()))
+        if k == 0:
+            return torch.ones_like(z)
 
-        # 稀疏路由：只增强 top-k 个最相关的 feature
-        topk_scores, topk_indices = torch.topk(
-            scores, min(self.topk_route, (active_mask > 0).sum().item()), dim=-1
-        )
+        topk_scores, topk_indices = torch.topk(scores, k, dim=-1)
 
-        # 构建 alpha：初始全为 1.0
-        alpha = torch.ones(self.latent_dim, device=z.device, dtype=z.dtype)
+        alpha = torch.ones(self.latent_dim, device=device, dtype=torch.float32)
+        scale = torch.exp(self.log_scale.to(device)).clamp(max=10.0)
+        boost = 1.0 + (self.max_alpha - 1.0) * torch.sigmoid(topk_scores * scale)
+        alpha[topk_indices] = boost
 
-        # 对 top-k feature 计算增强系数
-        # scale = exp(log_scale)，训练初期接近 1，之后学习增大
-        scale = torch.exp(self.log_scale).clamp(max=10.0)
-        boost = 1.0 + (self.max_alpha - 1.0) * torch.sigmoid(
-            topk_scores * scale
-        )
-        alpha[topk_indices] = boost.to(alpha.dtype)
-
-        # 广播到 (num_tokens, latent_dim)
         alpha = alpha.unsqueeze(0).expand(z.shape[0], -1)
 
-        # 最终只对真正激活的 token-feature 对生效
         token_active = (z > 0).float()
         alpha = alpha * token_active + 1.0 * (1.0 - token_active)
 
-        return alpha
+        return alpha.to(dtype)
