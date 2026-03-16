@@ -1,6 +1,5 @@
 """
 调试神经元
-
 用法：
     python scripts/explore.py --layer 8                        # 查看 feature 统计
     python scripts/explore.py --layer 8 --feature 27416        # 调试单个 feature
@@ -16,6 +15,7 @@ import random
 import argparse
 
 import numpy as np
+import scipy.sparse as sp
 import cv2
 import matplotlib.pyplot as plt
 
@@ -31,8 +31,17 @@ def load_cache(layer: int):
     return cache
 
 
-def show_feature_stats(all_z: np.ndarray, layer: int):
-    active_ids = np.where(all_z.max(axis=0) > 0)[0]
+def get_dense_z(item: dict) -> np.ndarray:
+    """从 cache item 里取出密集 z，兼容稀疏和密集两种格式。"""
+    z = item["z"]
+    if sp.issparse(z):
+        return z.toarray()
+    return z
+
+
+def show_feature_stats(cache: list, layer: int):
+    all_z      = np.concatenate([get_dense_z(item) for item in cache], axis=0)
+    active_ids = np.where(np.abs(all_z).max(axis=0) > 0)[0]
     print(f"active features: {len(active_ids)} / {all_z.shape[1]}")
 
     freq = (all_z > 0).mean(axis=0)
@@ -47,12 +56,16 @@ def show_feature_stats(all_z: np.ndarray, layer: int):
 def debug_feature(cache: list, feature_id: int, layer: int):
     results = []
     for item in cache:
+        z = get_dense_z(item)
         masked_img, image_score = make_masked_image(
-            item["image_path"], item["z"], feature_id,
+            item["image_path"], z, feature_id,
             item["H_tok"], item["W_tok"], top_n=CFG.top_n_patches,
         )
-        results.append({"image_path": item["image_path"],
-                        "masked_img": masked_img, "image_score": image_score})
+        results.append({
+            "image_path": item["image_path"],
+            "masked_img": masked_img,
+            "image_score": image_score,
+        })
 
     results.sort(key=lambda x: x["image_score"], reverse=True)
     top5 = results[:CFG.top_n_images]
@@ -81,20 +94,19 @@ def show_labels(layer: int, sample_n: int = 10):
 
 def main():
     parser = argparse.ArgumentParser()
-    parser.add_argument("--layer", type=int, default=CFG.vis_layer)
-    parser.add_argument("--feature", type=int, default=None, help="调试单个 feature id")
-    parser.add_argument("--show_labels", action="store_true", help="查看已有 Claude 标注")
+    parser.add_argument("--layer",       type=int, default=CFG.vis_layer)
+    parser.add_argument("--feature",     type=int, default=None)
+    parser.add_argument("--show_labels", action="store_true")
     args = parser.parse_args()
 
     cache = load_cache(args.layer)
-    all_z = np.concatenate([item["z"] for item in cache], axis=0)
 
     if args.show_labels:
         show_labels(args.layer)
     elif args.feature is not None:
         debug_feature(cache, args.feature, args.layer)
     else:
-        show_feature_stats(all_z, args.layer)
+        show_feature_stats(cache, args.layer)
 
 
 if __name__ == "__main__":

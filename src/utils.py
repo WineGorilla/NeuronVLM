@@ -11,8 +11,10 @@ import base64
 def get_top_features(z: np.ndarray, top_n: int = 32, mode: str = "mean"):
     """找激活最强的 top_n 个 feature。
 
+    判断 feature 是否活跃用绝对值，排序用绝对值找最显著的 feature。
+
     Args:
-        z:      shape (num_tokens, latent_dim)，SAE 编码输出
+        z:      shape (num_tokens, latent_dim)
         top_n:  返回的 feature 数量
         mode:   "mean" 取均值，"max" 取最大值
 
@@ -21,9 +23,9 @@ def get_top_features(z: np.ndarray, top_n: int = 32, mode: str = "mean"):
         feature_scores:  shape (top_n,)，对应分数
     """
     if mode == "mean":
-        scores = z.mean(axis=0)
+        scores = np.abs(z).mean(axis=0)
     elif mode == "max":
-        scores = z.max(axis=0)
+        scores = np.abs(z).max(axis=0)
     else:
         raise ValueError(f"mode must be 'mean' or 'max', got '{mode}'")
 
@@ -34,21 +36,11 @@ def get_top_features(z: np.ndarray, top_n: int = 32, mode: str = "mean"):
 
 def get_peak_blocks(z: np.ndarray, feature_ids, H_tok: int, W_tok: int,
                     img_h: int, img_w: int) -> list:
-    """找每个 feature 激活最强的图块，返回像素坐标信息。
-
-    Args:
-        z:           shape (num_tokens, latent_dim)
-        feature_ids: 要查询的 feature id 列表
-        H_tok, W_tok: token 网格尺寸（spatial merge 之后）
-        img_h, img_w: 原始图片像素尺寸
-
-    Returns:
-        list of dict，每个 dict 包含：
-            fid, tok_y, tok_x, px_x, px_y, block_w, block_h, activation
-    """
+    """找每个 feature 正激活最强的图块，返回像素坐标信息。"""
     blocks = []
     for fid in feature_ids:
         activations   = z[:, fid]
+        # 只看正激活最强的 token
         max_token_idx = int(activations.argmax())
         tok_y = max_token_idx // W_tok
         tok_x = max_token_idx %  W_tok
@@ -75,13 +67,16 @@ def get_peak_blocks(z: np.ndarray, feature_ids, H_tok: int, W_tok: int,
 
 def make_masked_image(image_path: str, z: np.ndarray, feature_id: int,
                       H_tok: int, W_tok: int, top_n: int = 32):
-    """只保留激活最强的 top_n 个 patch，其余置黑。
+    """只保留正激活最强的 top_n 个 patch，其余置黑。
+
+    语义标注用正激活：正激活代表"这里有这个概念"，负激活是抑制信号。
 
     Returns:
         masked:      np.ndarray (H, W, 3)，BGR
-        image_score: float，top_n patch 的平均激活值（用于跨图排序）
+        image_score: float，top_n patch 的平均正激活值（用于跨图排序）
     """
     activations       = z[:, feature_id]
+    # 只取正激活，按正值降序排序
     top_patch_indices = activations.argsort()[::-1][:top_n]
     image_score       = float(activations[top_patch_indices].mean())
 

@@ -90,6 +90,7 @@ class QwenLayerWithSAERouter(nn.Module):
         img_h = h_prime[:, vp: vp + nit, :]
         B, N_img, H = img_h.shape
         flat = img_h.reshape(B * N_img, H).float()
+        flat = torch.nn.functional.layer_norm(flat, [flat.shape[-1]])
 
         # 4) 取 text tokens hidden states 作为 query vector
         text_h = h_prime[:, text_pos, :]

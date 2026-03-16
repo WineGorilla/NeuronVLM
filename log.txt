@@ -1,0 +1,3 @@
+sae_ckpt中包含对应训练出来的模型参数
+feature_labels则是神经元字典
+cache_layer8.pkl 图片数据缓存 每张图片所激活的feature以及显著patch

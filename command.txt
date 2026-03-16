@@ -9,13 +9,14 @@ python -m src.train
 
 # 构建feature缓存 + 标注
 python scripts/interpret.py --layer 8
-python scripts/interpret.py --layer 24
+python scripts/interpret_local.py --layer 24
+python scripts/interpret.py --layer 8 --debug_feature 38 查看某个feature的图片效果
 
 # 查看标注
 python scripts/explore.py --layer 8 --show_labels
 
 # 可视化某个feature
 python scripts/explore.py --layer 8 --feature 100
-
+python scripts/explore.py --layer 24 --feature 6
 # 单张图热图
 python scripts/visualize.py --image data/images/train2014/COCO_train2014_000000000009.jpg --layer 8

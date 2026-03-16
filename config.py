@@ -16,13 +16,15 @@ class Config:
 
     # ── SAE 超参 ──────────────────────────────────────────────
     latent_mult: int = 8      # latent_dim = hidden_dim * latent_mult
-    topk: int = 64           
+    topk: int = 32           
 
     # ── 训练超参 ──────────────────────────────────────────────
-    batch_size: int = 1
-    epochs: int = 2
-    lr: float = 2e-4
-    sparsity_coef: float = 5e-3   # 辅助稀疏损失系数，抑制 dead features
+    batch_size:    int   = 1
+    epochs:        int   = 2
+    lr:            float = 1e-4   # 归一化去掉后可以稍大
+    sparsity_coef: float = 1e-2
+    grad_accum:    int   = 8
+    save_every: int = 5000   # 每 N 个 optimizer step 保存一次
 
     # ── 路径 ──────────────────────────────────────────────────
     save_dir: str = "outputs/sae_ckpt"

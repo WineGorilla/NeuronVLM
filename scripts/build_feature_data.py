@@ -46,7 +46,8 @@ def load_cache(layer: int) -> dict:
         f"Run `python scripts/build_cache.py --layer {layer}` first."
     with open(cache_path, "rb") as f:
         cache = pickle.load(f)
-    result = {item["image_path"]: item["z"] for item in cache}
+    import scipy.sparse as sp
+    result = {item["image_path"]: item["z"].toarray() if sp.issparse(item["z"]) else item["z"] for item in cache}
     print(f"  [layer {layer}] cache loaded: {len(result)} images")
     return result
 
