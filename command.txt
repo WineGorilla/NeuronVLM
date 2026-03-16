@@ -20,3 +20,9 @@ python scripts/explore.py --layer 8 --feature 100
 python scripts/explore.py --layer 24 --feature 6
 # 单张图热图
 python scripts/visualize.py --image data/images/train2014/COCO_train2014_000000000009.jpg --layer 8
+
+
+
+python -m src.train
+python scripts/build_cache.py --layer 8
+python scripts/build_feature_index.py --layer 8

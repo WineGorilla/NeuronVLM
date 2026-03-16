@@ -9,22 +9,24 @@ class Config:
     model_id: str = "Qwen/Qwen2.5-VL-3B-Instruct"
 
     # 数据
-    train_file: str = "data/train.jsonl"
+    train_file: str = "data/train_1k.jsonl"
 
     # ── SAE 层索引（内部会 +1 以跳过 embedding 层）──────────────
     layers: List[int] = field(default_factory=lambda: [8, 24])
 
     # ── SAE 超参 ──────────────────────────────────────────────
-    latent_mult: int = 8      # latent_dim = hidden_dim * latent_mult
+    latent_mult: int = 16      # latent_dim = hidden_dim * latent_mult
     topk: int = 32           
 
     # ── 训练超参 ──────────────────────────────────────────────
     batch_size:    int   = 1
     epochs:        int   = 2
     lr:            float = 1e-4   # 归一化去掉后可以稍大
-    sparsity_coef: float = 1e-2
+    sparsity_coef: float = 0.05
     grad_accum:    int   = 8
     save_every: int = 5000   # 每 N 个 optimizer step 保存一次
+
+
 
     # ── 路径 ──────────────────────────────────────────────────
     save_dir: str = "outputs/sae_ckpt"
