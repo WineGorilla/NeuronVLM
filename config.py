@@ -9,7 +9,7 @@ class Config:
     model_id: str = "Qwen/Qwen2.5-VL-3B-Instruct"
 
     # 数据
-    train_file: str = "data/train_1k.jsonl"
+    train_file: str = "data/train.jsonl"
 
     # ── SAE 层索引（内部会 +1 以跳过 embedding 层）──────────────
     layers: List[int] = field(default_factory=lambda: [8, 24])

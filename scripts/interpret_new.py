@@ -1,17 +1,10 @@
 """
-批量 SAE feature 语义标注流程（使用 feature_index 加速）：
-  1. 先运行 build_feature_index.py 生成 feature_index_layer{N}.pkl
-  2. 直接从 index 读取每个 feature 的 top 图片，无需遍历所有图
-  3. 用本地 Qwen2.5-VL-7B 标注语义
-  4. 断点续跑，结果保存到 feature_labels_layer{N}.json
+批量 SAE feature 语义标注流程（使用 feature_index 加速）。
 
 用法：
-    # 先构建 index（只需一次）
     python scripts/build_feature_index.py --layer 8
-
-    # 再标注
-    python scripts/interpret_new.py --layer 8
-    python scripts/interpret_new.py --layer 8 --debug_feature 100
+    python scripts/interpret.py --layer 8
+    python scripts/interpret.py --layer 8 --debug_feature 100
 """
 import os
 import sys
@@ -25,7 +18,6 @@ import tempfile
 import numpy as np
 import cv2
 import torch
-import torch.nn.functional as F
 import matplotlib.pyplot as plt
 from transformers import AutoProcessor, Qwen2_5_VLForConditionalGeneration
 from qwen_vl_utils import process_vision_info
@@ -35,6 +27,7 @@ from config import CFG
 
 ANNOTATOR_MODEL_ID = "Qwen/Qwen2.5-VL-7B-Instruct"
 TOP_N_IMAGES       = 3
+PREVIEW_DIR        = "outputs/feature_previews"   # 标注时保存拼接图的目录
 
 
 # ── 加载标注模型（7B）─────────────────────────────────────────────────────────
@@ -55,9 +48,6 @@ def load_annotator():
 # ── 从 feature_index 生成 masked 图 ──────────────────────────────────────────
 
 def make_masked_from_index(entry: tuple) -> dict:
-    """
-    entry: (score, image_path, H_tok, W_tok, top_patch_indices)
-    """
     score, image_path, H_tok, W_tok, top_patch_idx = entry
 
     img = cv2.imread(image_path)
@@ -82,6 +72,36 @@ def make_masked_from_index(entry: tuple) -> dict:
         "masked_img":  masked,
         "image_score": score,
     }
+
+
+# ── 保存拼接图 ────────────────────────────────────────────────────────────────
+
+def save_concat_image(top_results: list, feature_id: int, layer: int, label: str = ""):
+    """把 top_results 的 masked 图拼接保存，方便手动查看。"""
+    os.makedirs(PREVIEW_DIR, exist_ok=True)
+
+    target_h    = 400
+    concat_imgs = []
+    for res in top_results:
+        img     = res["masked_img"]
+        scale   = target_h / img.shape[0]
+        resized = cv2.resize(img, (int(img.shape[1] * scale), target_h))
+        bordered = cv2.copyMakeBorder(
+            resized, 5, 5, 5, 5,
+            cv2.BORDER_CONSTANT, value=(255, 255, 255)
+        )
+        concat_imgs.append(bordered)
+
+    combined = np.concatenate(concat_imgs, axis=1)
+
+    # 文件名包含 label，方便直接看出语义
+    label_str = label.replace(" ", "_").replace("/", "-")[:30] if label else "unlabeled"
+    save_path = os.path.join(
+        PREVIEW_DIR,
+        f"layer{layer}_f{feature_id:05d}_{label_str}.png"
+    )
+    cv2.imwrite(save_path, combined)
+    return save_path
 
 
 # ── 用 7B Qwen 标注 feature ───────────────────────────────────────────────────
@@ -154,7 +174,7 @@ def interpret_feature_with_qwen(
     return label
 
 
-# ── 可视化 ────────────────────────────────────────────────────────────────────
+# ── 可视化（debug 模式）──────────────────────────────────────────────────────
 
 def visualize_feature(feature_id: int, top_results: list, layer: int):
     n = len(top_results)
@@ -176,21 +196,7 @@ def visualize_feature(feature_id: int, top_results: list, layer: int):
     plt.tight_layout()
     plt.show()
 
-    target_h    = 400
-    concat_imgs = []
-    for res in top_results:
-        img     = res["masked_img"]
-        scale   = target_h / img.shape[0]
-        resized = cv2.resize(img, (int(img.shape[1] * scale), target_h))
-        bordered = cv2.copyMakeBorder(
-            resized, 5, 5, 5, 5,
-            cv2.BORDER_CONSTANT, value=(255, 255, 255)
-        )
-        concat_imgs.append(bordered)
-
-    combined  = np.concatenate(concat_imgs, axis=1)
-    save_path = os.path.join(CFG.cache_dir, f"feature_{feature_id}_layer{layer}_top{n}.png")
-    cv2.imwrite(save_path, combined)
+    save_path = save_concat_image(top_results, feature_id, layer)
     print(f"saved: {save_path}")
 
 
@@ -202,15 +208,14 @@ def main():
     parser.add_argument("--debug_feature", type=int, default=None)
     args = parser.parse_args()
 
-    os.makedirs(CFG.label_dir, exist_ok=True)
-    os.makedirs(CFG.cache_dir, exist_ok=True)
+    os.makedirs(CFG.label_dir,  exist_ok=True)
+    os.makedirs(CFG.cache_dir,  exist_ok=True)
+    os.makedirs(PREVIEW_DIR,    exist_ok=True)
 
-    # 加载 feature index
     index_path = os.path.join(CFG.cache_dir, f"feature_index_layer{args.layer}.pkl")
     if not os.path.exists(index_path):
         print(f"Feature index not found: {index_path}")
-        print(f"Please run first:")
-        print(f"  python scripts/build_feature_index.py --layer {args.layer}")
+        print(f"Please run: python scripts/build_feature_index.py --layer {args.layer}")
         return
 
     print(f"Loading feature index: {index_path}")
@@ -242,6 +247,7 @@ def main():
 
     feature_ids = sorted(feature_index.keys())
     print(f"Total features to label: {len(feature_ids)}")
+    print(f"Preview images saved to: {PREVIEW_DIR}")
 
     for idx, fid in enumerate(feature_ids):
         if fid in feature_label_dict:
@@ -258,6 +264,10 @@ def main():
             ann_processor, ann_model,
         )
         feature_label_dict[fid] = label
+
+        # 保存拼接图，文件名包含标注结果
+        save_concat_image(top_results, fid, args.layer, label)
+
         print(f"  [{idx+1}/{len(feature_ids)}] feature {fid:6d} -> {label}")
 
         if len(feature_label_dict) % 10 == 0:
