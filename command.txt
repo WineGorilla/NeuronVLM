@@ -22,7 +22,32 @@ python scripts/explore.py --layer 24 --feature 6
 python scripts/visualize.py --image data/images/train2014/COCO_train2014_000000000009.jpg --layer 8
 
 
-
+流程顺序
+# 训练SAE
 python -m src.train
+# 缓存每张图片的神经元激活
 python scripts/build_cache.py --layer 8
+# 转换为Index方便计算筛选
 python scripts/build_feature_index.py --layer 8
+# 进行特曾层SAE的神经元标注
+python scripts/interpret.py --layer 8
+# 为数据集添加每个问题对应调用的神经元
+python scripts/build_feature_data.py
+
+
+
+
+
+
+#src folder
+Model.py: 整体模型结构
+SAE: SAE结构
+train.py: 训练SAE
+train_router.py: 训练整体模型
+datasets.py: 构建训练数据
+
+#scripts folder
+build_data.py: 构建初始数据集，包含图片，问题，回答
+build_data_feature: 构建模型训练数据集，除了图片，问题，回答，还有思考所用的神经元
+build_feature_index: 讲每张图片的神经元激活转换为更方便计算的方式，得到feature_index_layerx
+
