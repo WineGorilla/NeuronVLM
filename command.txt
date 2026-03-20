@@ -72,11 +72,12 @@ python scripts/cluster_features.py --layer 8 --n_clusters 32
 # 5. 构建训练数据
 python data/build_cluster_data.py --layer 8
 
-# 6. 阶段1：训练模型输出 <think>
-python -m src.train_focus
+# 
+# 阶段1：训练 ClusterPredictor（BCE loss）
+python -m src.train_focus --stage 1
 
-# 7. 阶段2：联合训练
-python -m src.train_focus --joint --resume best
+# 阶段2：冻结 ClusterPredictor，微调 Qwen 最后8层（LM loss）
+python -m src.train_focus --stage 2 --resume best
 
 # 8. 推理
 python scripts/inference.py \
@@ -87,18 +88,6 @@ python scripts/inference.py \
 
 
 # 模型训练
-PatchInjectionHook：
-    用 PyTorch forward hook 在 layer 8 的输出里
-    把选中的 patch hidden state 注入到所有 image token
-
-QwenWithFocusAndSAE：
-    forward_first：只用问题文字 → 生成 <think>[2,9]</think>
-    get_cluster_patches：SAE encode 图片 → z → 找每个 cluster 激活最强的 patch hidden state
-    forward_second：注入 patch → 生成答案（训练时返回 loss，推理时返回文字）
-    compute_loss：训练用，计算 loss_inject + aux_loss
-    generate：推理入口，串联三个步骤
-    from_pretrained：一键加载全部组件
-
 
 # train_focus
 阶段1（默认）：python -m src.train_focus
@@ -107,12 +96,19 @@ QwenWithFocusAndSAE：
     让模型学会根据问题输出正确的 cluster
 
 阶段2（联合）：python -m src.train_focus --joint
-    在阶段1基础上继续训练
-    loss = loss_inject + 0.1 * relu(loss_inject - loss_base + 0.1)
-    让模型学会：选对 cluster → 注入正确 patch → 回答更准确
+    冻结predictor,在阶段1基础上继续训练
 
 
-#inference
-1. 加载 QwenWithFocusAndSAE
-2. 调用 model.generate(image, question)
-3. 打印 think/clusters/base_answer/final_answer 对比
+# Inference推理过程
+# 只用阶段1（只有 predictor）
+python scripts/inference.py \
+    --image xxx.jpg \
+    --question "What color is the dog?" \
+    --predictor_ckpt outputs/focus_ckpt/predictor_best.pt
+
+# 阶段1 + 阶段2（predictor + 微调 Qwen）
+python scripts/inference.py \
+    --image xxx.jpg \
+    --question "What color is the dog?" \
+    --predictor_ckpt outputs/focus_ckpt/predictor_best.pt \
+    --qwen_ckpt      outputs/focus_ckpt/qwen_best.pt
