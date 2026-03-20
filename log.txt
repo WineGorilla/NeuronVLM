@@ -7,3 +7,7 @@ build_cache1 构造缓存使用的是数据集中的question
 BUild_cache 构造缓存使用的固定question
 
 interpret_new.py 是新版根据存储的图片缓存进行挑选feature index
+
+
+
+cluster_features将SAE中的每个神经元进行聚类，并保存至assets/feature_clusters_layer8.json

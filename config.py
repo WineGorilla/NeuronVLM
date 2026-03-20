@@ -12,7 +12,7 @@ class Config:
     train_file: str = "data/train.jsonl"
 
     # ── SAE 层索引（内部会 +1 以跳过 embedding 层）──────────────
-    layers: List[int] = field(default_factory=lambda: [8, 24])
+    layers: List[int] = field(default_factory=lambda: [8])
 
     # ── SAE 超参 ──────────────────────────────────────────────
     latent_mult: int = 16      # latent_dim = hidden_dim * latent_mult
@@ -31,7 +31,7 @@ class Config:
     # ── 路径 ──────────────────────────────────────────────────
     save_dir: str = "outputs/sae_ckpt"
     cache_dir: str = "outputs"
-    label_dir: str = "outputs/feature_labels"
+    label_dir: str = "assets"
 
     # ── 推理 / 可视化 
     vis_layer: int = 8           # 可视化时使用的层
