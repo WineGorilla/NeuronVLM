@@ -3,9 +3,9 @@
 
 训练逻辑：
     对每条数据 {image, question, answer, focus_clusters}：
-    1. 第一阶段（冻结，只训练 <think> 输出）：
+    1. 第一阶段（只训练 <think> 输出）：
        只用问题文字 → <think>[ids]</think>
-       LM loss 对 <think> 部分计算
+       LM loss 只对 <think>...</think> 部分计算
     2. 第二阶段（联合训练）：
        用 focus_clusters 找最强 patch → 注入 → 计算 loss_inject
        不注入 → 计算 loss_base
@@ -27,12 +27,11 @@ from torch.utils.data import DataLoader
 from transformers import AutoProcessor, Qwen2_5_VLForConditionalGeneration
 
 from config import CFG
-from src.SAE import SAE
 from src.Model import QwenWithFocusAndSAE
 from src.dataset import VisionTextDataset
 
 
-LR         = 1e-5
+LR         = 1e-6
 EPOCHS     = 3
 GRAD_ACCUM = 8
 LOG_EVERY  = 10
@@ -43,31 +42,42 @@ SAVE_DIR   = "outputs/focus_ckpt"
 def build_labels_think(input_ids: torch.Tensor, processor) -> torch.Tensor:
     """
     只对 <think>...</think> 部分计算 loss。
-    用于阶段1训练。
+    通过字符串映射找到对应的 token 位置，不依赖具体 token id。
     """
-    from src.dataset import THINK_START, THINK_END
-    labels    = torch.full_like(input_ids, -100)
-    think_start_ids = processor.tokenizer.encode(THINK_START, add_special_tokens=False)
-    think_end_ids   = processor.tokenizer.encode(THINK_END,   add_special_tokens=False)
+    labels = torch.full_like(input_ids, -100)
 
     for b in range(input_ids.shape[0]):
-        ids = input_ids[b].tolist()
-        # 找 <think> 和 </think> 的位置
-        start_pos = None
-        for i in range(len(ids) - len(think_start_ids)):
-            if ids[i:i+len(think_start_ids)] == think_start_ids:
-                start_pos = i
-                break
-        if start_pos is None:
+        full_text = processor.tokenizer.decode(
+            input_ids[b], skip_special_tokens=False
+        )
+
+        if "<think>" not in full_text or "</think>" not in full_text:
             continue
-        end_pos = None
-        for i in range(start_pos, len(ids) - len(think_end_ids)):
-            if ids[i:i+len(think_end_ids)] == think_end_ids:
-                end_pos = i + len(think_end_ids)
+
+        think_start_char = full_text.index("<think>")
+        think_end_char   = full_text.index("</think>") + len("</think>")
+
+        ids         = input_ids[b].tolist()
+        token_start = None
+        token_end   = None
+        cur_char    = 0
+
+        for i, tok_id in enumerate(ids):
+            tok_str = processor.tokenizer.decode(
+                [tok_id], skip_special_tokens=False
+            )
+            tok_len = len(tok_str)
+
+            if token_start is None and cur_char + tok_len > think_start_char:
+                token_start = i
+            if token_start is not None and cur_char + tok_len >= think_end_char:
+                token_end = i + 1
                 break
-        if end_pos is None:
-            continue
-        labels[b, start_pos:end_pos] = input_ids[b, start_pos:end_pos]
+
+            cur_char += tok_len
+
+        if token_start is not None and token_end is not None:
+            labels[b, token_start:token_end] = input_ids[b, token_start:token_end]
 
     return labels
 
@@ -95,9 +105,7 @@ def build_labels_answer(input_ids: torch.Tensor, processor) -> torch.Tensor:
 
 
 def collate_think_only(processor):
-    """
-    阶段1的 collate：只用问题文字构建输入，输出 <think>。
-    """
+    """阶段1的 collate：只用问题文字构建输入，输出 <think>。"""
     from src.dataset import THINK_START, THINK_END
 
     def collate(batch):
@@ -114,7 +122,9 @@ def collate_think_only(processor):
             ])
 
         texts  = [
-            processor.apply_chat_template(m, tokenize=False, add_generation_prompt=False)
+            processor.apply_chat_template(
+                m, tokenize=False, add_generation_prompt=False
+            )
             for m in messages
         ]
         inputs = processor(text=texts, padding=True, return_tensors="pt")
@@ -134,25 +144,30 @@ def main():
 
     if args.joint:
         # 阶段2：加载完整模型
-        cluster_path = os.path.join(CFG.label_dir, f"feature_clusters_layer{CFG.vis_layer}.json")
-        focus_ckpt   = os.path.join(SAVE_DIR, f"model_{args.resume}.pt") if args.resume else None
+        cluster_path = os.path.join(
+            CFG.label_dir, f"feature_clusters_layer{CFG.vis_layer}.json"
+        )
+        focus_ckpt = (
+            os.path.join(SAVE_DIR, f"model_{args.resume}.pt")
+            if args.resume else None
+        )
 
         model = QwenWithFocusAndSAE.from_pretrained(
-            model_id     = CFG.model_id,
-            sae_ckpt_dir = CFG.save_dir,
-            cluster_path = cluster_path,
-            layer        = CFG.vis_layer,
-            latent_mult  = CFG.latent_mult,
-            topk         = CFG.topk,
-            inject_scale = 0.3,
-            aux_lambda   = 0.1,
-            aux_margin   = 0.1,
-            focus_ckpt   = focus_ckpt,
-            device       = CFG.device,
+            model_id      = CFG.model_id,
+            sae_ckpt_dir  = CFG.save_dir,
+            cluster_path  = cluster_path,
+            layer         = CFG.vis_layer,
+            latent_mult   = CFG.latent_mult,
+            topk          = CFG.topk,
+            top_n_patches = CFG.top_n_patches,
+            inject_scale  = 0.3,
+            aux_lambda    = 0.1,
+            aux_margin    = 0.1,
+            focus_ckpt    = focus_ckpt,
+            device        = CFG.device,
         )
         processor = model.processor
 
-        # 只训练最后 8 层 + lm_head
         for p in model.base_model.parameters():
             p.requires_grad = False
         layers = model.base_model.model.language_model.layers
@@ -163,15 +178,15 @@ def main():
         for p in model.base_model.lm_head.parameters():
             p.requires_grad = True
 
-        dataset    = VisionTextDataset(args.data)
-        use_joint  = True
+        dataset   = VisionTextDataset(args.data)
+        use_joint = True
 
     else:
         # 阶段1：只训练 <think> 输出
         print("Loading Qwen2.5-VL...")
-        processor = AutoProcessor.from_pretrained(CFG.model_id)
+        processor  = AutoProcessor.from_pretrained(CFG.model_id)
         base_model = Qwen2_5_VLForConditionalGeneration.from_pretrained(
-            CFG.model_id, torch_dtype=torch.float16,
+            CFG.model_id, torch_dtype=torch.bfloat16,
         ).to(CFG.device)
 
         for p in base_model.parameters():
@@ -187,22 +202,23 @@ def main():
         if args.resume:
             ckpt = os.path.join(SAVE_DIR, f"model_{args.resume}.pt")
             if os.path.exists(ckpt):
-                base_model.load_state_dict(torch.load(ckpt, map_location="cpu"), strict=False)
+                base_model.load_state_dict(
+                    torch.load(ckpt, map_location="cpu"), strict=False
+                )
                 print(f"Resumed: {ckpt}")
 
         model     = base_model
         dataset   = VisionTextDataset(args.data)
         use_joint = False
 
-    trainable = sum(p.numel() for p in (model.base_model if use_joint else model).parameters()
-                    if p.requires_grad)
-    total     = sum(p.numel() for p in (model.base_model if use_joint else model).parameters())
+    m         = model.base_model if use_joint else model
+    trainable = sum(p.numel() for p in m.parameters() if p.requires_grad)
+    total     = sum(p.numel() for p in m.parameters())
     print(f"Mode      : {'joint' if use_joint else 'think-only'}")
     print(f"Dataset   : {len(dataset)} samples")
     print(f"Trainable : {trainable:,} / {total:,} ({100*trainable/total:.2f}%)")
 
-    params    = [p for p in (model.base_model if use_joint else model).parameters()
-                 if p.requires_grad]
+    params    = [p for p in m.parameters() if p.requires_grad]
     optimizer = torch.optim.AdamW(params, lr=LR, weight_decay=1e-4)
 
     if not use_joint:
@@ -214,10 +230,12 @@ def main():
     # ── 保存函数 ──────────────────────────────────────────────
     def save_model(tag: str):
         path  = os.path.join(SAVE_DIR, f"model_{tag}.pt")
-        m     = model.base_model if use_joint else model
         state = {
             k: v for k, v in m.state_dict().items()
-            if any(k.startswith(f"model.language_model.layers.{i}.") for i in trainable_layer_ids)
+            if any(
+                k.startswith(f"model.language_model.layers.{i}.")
+                for i in trainable_layer_ids
+            )
             or k.startswith("lm_head.")
         }
         torch.save(state, path)
@@ -244,9 +262,8 @@ def main():
         micro_count = 0
 
         if use_joint:
-            # 联合训练：手动遍历数据
             import random
-            indices = list(range(len(dataset)))
+            indices  = list(range(len(dataset)))
             random.shuffle(indices)
             iterator = (dataset[i] for i in indices)
         else:
@@ -255,7 +272,6 @@ def main():
         for step, item in enumerate(iterator):
             try:
                 if use_joint:
-                    # 联合训练：直接调用 compute_loss
                     total_loss, l_inj, l_base, l_aux = model.compute_loss(
                         image_path     = item["image"],
                         question       = item["question"],
@@ -265,20 +281,26 @@ def main():
                     loss = total_loss / GRAD_ACCUM
 
                     if step % LOG_EVERY == 0:
-                        print(f"  step {step} | "
-                              f"total={total_loss.item():.4f} "
-                              f"inject={l_inj:.4f} "
-                              f"base={l_base:.4f} "
-                              f"aux={l_aux:.4f}")
+                        print(
+                            f"  step {step:5d} | "
+                            f"total={total_loss.item():.4f} "
+                            f"inject={l_inj:.4f} "
+                            f"base={l_base:.4f} "
+                            f"aux={l_aux:.4f}"
+                        )
                 else:
-                    # 阶段1：只训练 <think>
-                    batch  = item
-                    batch  = {k: v.to(CFG.device) if torch.is_tensor(v) else v
-                               for k, v in batch.items()}
-                    labels = build_labels_think(batch["input_ids"], processor).to(CFG.device)
+                    batch  = {
+                        k: v.to(CFG.device) if torch.is_tensor(v) else v
+                        for k, v in item.items()
+                    }
+                    labels = build_labels_think(
+                        batch["input_ids"], processor
+                    ).to(CFG.device)
+
                     if (labels != -100).sum() == 0:
                         continue
-                    outputs = model(
+
+                    outputs    = model(
                         **{k: v for k, v in batch.items() if torch.is_tensor(v)},
                         labels=labels, return_dict=True,
                     )
@@ -286,12 +308,13 @@ def main():
                     loss       = total_loss / GRAD_ACCUM
 
                     if step % LOG_EVERY == 0:
-                        print(f"  step {step} | loss={total_loss.item():.4f}")
+                        print(f"  step {step:5d} | loss={total_loss.item():.4f}")
 
                 if torch.isnan(total_loss) or torch.isinf(total_loss):
                     print(f"  [skip] nan/inf at step {step}")
                     optimizer.zero_grad(set_to_none=True)
-                    accum_loss = 0.0; micro_count = 0
+                    accum_loss = 0.0
+                    micro_count = 0
                     continue
 
                 loss.backward()
@@ -301,7 +324,8 @@ def main():
             except Exception as e:
                 print(f"  [skip] step {step}: {e}")
                 optimizer.zero_grad(set_to_none=True)
-                accum_loss = 0.0; micro_count = 0
+                accum_loss  = 0.0
+                micro_count = 0
                 continue
 
             if micro_count == GRAD_ACCUM:
@@ -309,23 +333,26 @@ def main():
                 optimizer.step()
                 optimizer.zero_grad(set_to_none=True)
 
-                eff_loss    = accum_loss / GRAD_ACCUM
-                epoch_loss += eff_loss
+                eff_loss     = accum_loss / GRAD_ACCUM
+                epoch_loss  += eff_loss
                 valid_steps += 1
                 global_step += 1
 
                 if global_step % SAVE_EVERY == 0:
                     save_model(f"step{global_step}")
 
-                accum_loss = 0.0; micro_count = 0
+                accum_loss  = 0.0
+                micro_count = 0
 
-        # flush
+        # flush 剩余梯度
         if micro_count > 0:
             torch.nn.utils.clip_grad_norm_(params, max_norm=1.0)
             optimizer.step()
             optimizer.zero_grad(set_to_none=True)
-            epoch_loss += accum_loss / micro_count
+            epoch_loss  += accum_loss / micro_count
             valid_steps += 1
+            accum_loss   = 0.0
+            micro_count  = 0
 
         if valid_steps == 0:
             print("  No valid steps.")
