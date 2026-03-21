@@ -2,16 +2,18 @@
 推理脚本。
 
 用法：
-    python scripts/inference.py \
-        --image data/images/train2014/xxx.jpg \
-        --question "What color is the dog?"
+    python src/inference.py \
+        --image data/images/train2014/COCO_train2014_000000423678.jpg \
+        --question "After the tennis match, what behavior between the two main players demonstrates sportsmanship?"
+        --predictor_ckpt outputs/focus_ckpt/predictor_best.pt \
+        --qwen_ckpt outputs/focus_ckpt/qwen_best.pt
 
     # 指定两个阶段的权重
-    python scripts/inference.py \
+    python src/inference.py \
         --image xxx.jpg \
         --question "..." \
         --predictor_ckpt outputs/focus_ckpt/predictor_best.pt \
-        --qwen_ckpt      outputs/focus_ckpt/qwen_best.pt
+        --qwen_ckpt outputs/focus_ckpt/qwen_best.pt
 """
 import os
 import sys
@@ -19,22 +21,19 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(__file__)))
 
 import argparse
 import torch
+
 from config import CFG
 from src.Model import QwenWithClusterPredictorAndSAE
 
 
 def main():
     parser = argparse.ArgumentParser()
-    parser.add_argument("--image",           type=str, required=True)
-    parser.add_argument("--question",        type=str, required=True)
-    parser.add_argument("--layer",           type=int, default=CFG.vis_layer)
-    parser.add_argument("--inject_scale",    type=float, default=0.3)
-    parser.add_argument("--predictor_ckpt",  type=str,
-                        default="outputs/focus_ckpt/predictor_best.pt",
-                        help="阶段1 ClusterPredictor 权重")
-    parser.add_argument("--qwen_ckpt",       type=str,
-                        default=None,
-                        help="阶段2 Qwen 微调权重（可选）")
+    parser.add_argument("--image",          type=str, required=True)
+    parser.add_argument("--question",       type=str, required=True)
+    parser.add_argument("--layer",          type=int, default=CFG.vis_layer)
+    parser.add_argument("--predictor_ckpt", type=str,
+                        default="outputs/focus_ckpt/predictor_best.pt")
+    parser.add_argument("--qwen_ckpt",      type=str, default=None)
     args = parser.parse_args()
 
     cluster_path = os.path.join(
@@ -48,13 +47,11 @@ def main():
         inject_layer      = args.layer,
         latent_mult       = CFG.latent_mult,
         topk              = CFG.topk,
-        inject_scale      = args.inject_scale,
         top_n_patches     = CFG.top_n_patches,
         predictor_ckpt    = args.predictor_ckpt,
         device            = CFG.device,
     )
 
-    # 加载阶段2的 Qwen 微调权重（如果有）
     if args.qwen_ckpt and os.path.exists(args.qwen_ckpt):
         print(f"Loading Qwen fine-tuned weights: {args.qwen_ckpt}")
         state = torch.load(args.qwen_ckpt, map_location="cpu")

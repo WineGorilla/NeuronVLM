@@ -4,12 +4,10 @@
 阶段1：python -m src.train_focus --stage 1
     冻结 Qwen + SAE，只训练 ClusterPredictor
     loss = BCE loss
-    目标：根据问题正确预测需要关注的 cluster
 
 阶段2：python -m src.train_focus --stage 2 --resume best
     冻结 ClusterPredictor + SAE，解冻 Qwen 最后8层
-    loss = LM loss（注入增强后）
-    目标：Qwen 学会利用注入的特征回答更好
+    loss = LM loss（concat extra token 后）
 """
 import os
 import sys
@@ -19,15 +17,15 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(__file__)))
 import argparse
 import random
 import torch
-from transformers import AutoProcessor, Qwen2_5_VLForConditionalGeneration
+import torch.nn.functional as F
 
 from config import CFG
 from src.Model import QwenWithClusterPredictorAndSAE
 from src.dataset import VisionTextDataset
 
 
-LR_STAGE1  = 1e-4   # ClusterPredictor，小 MLP 可以大一点
-LR_STAGE2  = 1e-5   # Qwen 最后8层，保守一点
+LR_STAGE1  = 1e-4
+LR_STAGE2  = 1e-5
 EPOCHS     = 3
 GRAD_ACCUM = 8
 LOG_EVERY  = 10
@@ -38,8 +36,7 @@ SAVE_DIR   = "outputs/focus_ckpt"
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--stage",  type=int, default=1, choices=[1, 2])
-    parser.add_argument("--resume", type=str, default=None,
-                        help="加载已有 predictor checkpoint 的 tag")
+    parser.add_argument("--resume", type=str, default=None)
     parser.add_argument("--data",   type=str, default="data/train_cluster.jsonl")
     args = parser.parse_args()
 
@@ -55,7 +52,6 @@ def main():
         inject_layer      = CFG.vis_layer,
         latent_mult       = CFG.latent_mult,
         topk              = CFG.topk,
-        inject_scale      = 0.3,
         top_n_patches     = CFG.top_n_patches,
         cluster_threshold = 0.5,
         bce_lambda        = 0.5,
@@ -66,33 +62,22 @@ def main():
     dataset = VisionTextDataset(args.data)
 
     if args.stage == 1:
-        # ── 阶段1：只训练 ClusterPredictor ────────────────────
         print("Stage 1: Training ClusterPredictor only")
-
-        # 冻结 Qwen
         for p in model.base_model.parameters():
             p.requires_grad = False
-
-        # 只训练 ClusterPredictor
         for p in model.cluster_predictor.parameters():
             p.requires_grad = True
-
-        params = list(model.cluster_predictor.parameters())
-        lr     = LR_STAGE1
+        params            = list(model.cluster_predictor.parameters())
+        lr                = LR_STAGE1
+        trainable_layer_ids = []
 
     else:
-        # ── 阶段2：冻结 ClusterPredictor，解冻 Qwen 最后8层 ───
         print("Stage 2: Fine-tuning Qwen last 8 layers")
-
-        # 冻结 ClusterPredictor
         for p in model.cluster_predictor.parameters():
             p.requires_grad = False
-
-        # 冻结全部 Qwen
         for p in model.base_model.parameters():
             p.requires_grad = False
 
-        # 解冻最后8层 + lm_head
         layers = model.base_model.model.language_model.layers
         trainable_layer_ids = list(range(len(layers) - 8, len(layers)))
         for i in trainable_layer_ids:
@@ -162,53 +147,40 @@ def main():
                     )
                     vision_pos, num_img_tokens, text_positions = \
                         model._get_token_positions(inputs)
-                    h_before = model._get_hidden_before_layer(inputs, model.inject_layer)
-
-                    logits = model.cluster_predictor(h_before, text_positions)
+                    h_before   = model._get_hidden_before_layer(inputs, model.inject_layer)
+                    logits     = model.cluster_predictor(h_before, text_positions)
 
                     target = torch.zeros(1, model.n_clusters, device=model.device)
                     for cid in item.get("focus_clusters", []):
                         if 0 <= cid < model.n_clusters:
                             target[0, cid] = 1.0
 
-                    import torch.nn.functional as F
                     total_loss = F.binary_cross_entropy_with_logits(logits, target)
 
                     if step % LOG_EVERY == 0:
                         print(f"  step {step:5d} | bce={total_loss.item():.4f}")
 
                 else:
-                    # 阶段2：只算 LM loss（注入增强后）
+                    # 阶段2：只算 LM loss（concat extra token 后）
                     total_loss, lm_loss, bce_loss = model.compute_loss(
                         image_path     = item["image"],
                         question       = item["question"],
                         answer         = item["answer"],
                         focus_clusters = item.get("focus_clusters", []),
                     )
-                    # 阶段2只用 lm_loss
-                    total_loss = torch.tensor(lm_loss, device=model.device, requires_grad=True)
-
-                    # 重新计算以获取梯度
-                    total_loss, lm_loss, _ = model.compute_loss(
-                        image_path     = item["image"],
-                        question       = item["question"],
-                        answer         = item["answer"],
-                        focus_clusters = item.get("focus_clusters", []),
-                    )
-                    # 只取 lm_loss 部分
-                    total_loss = total_loss - model.bce_lambda * torch.tensor(
-                        bce_loss, device=model.device
-                    )
+                    # 阶段2只用 lm_loss，去掉 bce 部分
+                    total_loss = total_loss - model.bce_lambda * bce_loss
 
                     if step % LOG_EVERY == 0:
-                        print(f"  step {step:5d} | lm={lm_loss:.4f}")
+                        print(f"  step {step:5d} | lm={lm_loss:.4f} bce={bce_loss:.4f}")
 
                 loss = total_loss / GRAD_ACCUM
 
                 if torch.isnan(total_loss) or torch.isinf(total_loss):
                     print(f"  [skip] nan/inf at step {step}")
                     optimizer.zero_grad(set_to_none=True)
-                    accum_loss = 0.0; micro_count = 0
+                    accum_loss = 0.0
+                    micro_count = 0
                     continue
 
                 loss.backward()
@@ -218,7 +190,8 @@ def main():
             except Exception as e:
                 print(f"  [skip] step {step}: {e}")
                 optimizer.zero_grad(set_to_none=True)
-                accum_loss = 0.0; micro_count = 0
+                accum_loss  = 0.0
+                micro_count = 0
                 continue
 
             if micro_count == GRAD_ACCUM:
@@ -234,7 +207,8 @@ def main():
                 if global_step % SAVE_EVERY == 0:
                     save(f"step{global_step}")
 
-                accum_loss = 0.0; micro_count = 0
+                accum_loss  = 0.0
+                micro_count = 0
 
         # flush
         if micro_count > 0:

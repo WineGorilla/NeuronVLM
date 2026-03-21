@@ -2,16 +2,18 @@
 QwenWithClusterPredictorAndSAE：完整模型。
 
 架构：
-    1. Qwen 跑到 layer 7（layer 之前）
+    1. 获取 layer 7 的 hidden state
     2. ClusterPredictor 预测需要关注的 cluster
-    3. SAE encode layer 7 的 image token hidden state → z
-       找每个预测 cluster 里激活最强的 patch
-    4. 注入 feature 语义增强
-    5. 继续 layer 8 → 后面的层 → 生成答案
+    3. SAE encode → 找每个 cluster 激活最强的 patch
+    4. 把这些 patch 的 layer 7 hidden state 作为 extra token
+       直接在 inputs_embeds 层 concat 到 image token 后面
+    5. 用 inputs_embeds 调用模型 → 所有 attention/mask 自动对齐
+    6. 生成答案
 
-训练：
-    BCE loss（cluster 预测）+ LM loss（答案生成）联合训练
-    预测头参数量极小，收敛快
+核心思想：
+    在 embedding 层操作，不需要 hook
+    extra token 的 hidden state 来自 layer 7（和 image token 同一空间）
+    所有下游计算自动对齐，不会有维度不匹配问题
 """
 import os
 import json
@@ -26,12 +28,6 @@ from src.SAE import SAE
 # ── Cluster 预测头 ────────────────────────────────────────────────────────────
 
 class ClusterPredictor(nn.Module):
-    """
-    轻量 MLP，在 layer inject_layer 之前的 hidden state 上预测 cluster。
-    输入：text token hidden state 的均值
-    输出：每个 cluster 的 logit（多标签分类）
-    """
-
     def __init__(self, hidden_dim: int, n_clusters: int):
         super().__init__()
         self.head = nn.Sequential(
@@ -41,110 +37,37 @@ class ClusterPredictor(nn.Module):
         )
 
     def forward(self, h: torch.Tensor, text_positions: torch.Tensor) -> torch.Tensor:
-        """
-        Args:
-            h:              (1, seq_len, hidden_dim)
-            text_positions: text token 的索引
-        Returns:
-            logits: (1, n_clusters)
-        """
-        text_h = h[:, text_positions, :]   # (1, n_text, hidden_dim)
-        q      = text_h.float().mean(dim=1)  # (1, hidden_dim)
-        return self.head(q)                  # (1, n_clusters)
-
-
-# ── Patch 注入 Hook ───────────────────────────────────────────────────────────
-
-class PatchInjectionHook:
-    """
-    通过 forward hook 在指定 layer 注入 feature 语义增强。
-    在 layer 执行之前注入（pre-hook），让 layer 处理增强后的 hidden state。
-    """
-
-    def __init__(
-        self,
-        inject_ops:     list,   # [(patch_idx, feature_dir, strength), ...]
-        vision_pos:     int,
-        num_img_tokens: int,
-        inject_scale:   float = 0.3,
-    ):
-        self.inject_ops     = inject_ops
-        self.vision_pos     = vision_pos
-        self.num_img_tokens = num_img_tokens
-        self.inject_scale   = inject_scale
-        self.handle         = None
-
-    def hook_fn(self, module, input):
-        """pre_forward_hook：在 layer forward 之前修改输入。"""
-        if isinstance(input, tuple):
-            h    = input[0]
-            rest = input[1:]
-        else:
-            return input
-
-        vp, nit = self.vision_pos, self.num_img_tokens
-        if vp < 0 or nit <= 0 or (vp + nit) > h.shape[1]:
-            return input
-
-        h_new = h.clone()
-        for patch_idx, feature_dir, strength in self.inject_ops:
-            if patch_idx >= nit:
-                continue
-            feature_dir = feature_dir.to(h.device).to(h.dtype)
-            h_new[:, vp + patch_idx, :] += \
-                self.inject_scale * strength * feature_dir.unsqueeze(0)
-
-        return (h_new,) + rest
-
-    def register(self, layer_module):
-        # 用 pre-hook，在 layer 执行之前注入
-        self.handle = layer_module.register_forward_pre_hook(self.hook_fn)
-
-    def remove(self):
-        if self.handle is not None:
-            self.handle.remove()
-            self.handle = None
+        text_h = h[:, text_positions, :]
+        q      = text_h.float().mean(dim=1)
+        return self.head(q)
 
 
 # ── 完整模型 ──────────────────────────────────────────────────────────────────
 
 class QwenWithClusterPredictorAndSAE(nn.Module):
-    """
-    完整模型：Qwen + ClusterPredictor + 冻结 SAE + patch 注入。
-
-    单次 forward 流程：
-        1. Qwen 跑到 inject_layer 之前
-        2. ClusterPredictor 预测 cluster
-        3. SAE encode → 找注入操作
-        4. 注册 pre-hook 到 inject_layer
-        5. 继续 forward → 生成答案
-    """
 
     def __init__(
         self,
         base_model,
-        sae:            SAE,
+        sae:               SAE,
         processor,
-        cluster_info:   dict,
-        inject_layer:   int   = 8,
-        inject_scale:   float = 0.3,
-        top_n_patches:  int   = 60,
-        cluster_threshold: float = 0.5,   # sigmoid 输出大于此值则选择该 cluster
-        bce_lambda:     float = 0.5,      # BCE loss 权重
-        max_tokens:     int   = 128,
+        cluster_info:      dict,
+        inject_layer:      int   = 8,
+        top_n_patches:     int   = 60,
+        cluster_threshold: float = 0.5,
+        bce_lambda:        float = 0.5,
+        max_tokens:        int   = 128,
     ):
         super().__init__()
-        self.base_model         = base_model
-        self.sae                = sae
-        self.processor          = processor
-        self.inject_layer       = inject_layer
-        self.inject_scale       = inject_scale
-        self.top_n_patches      = top_n_patches
-        self.cluster_threshold  = cluster_threshold
-        self.bce_lambda         = bce_lambda
-        self.max_tokens         = max_tokens
+        self.base_model        = base_model
+        self.sae               = sae
+        self.processor         = processor
+        self.inject_layer      = inject_layer
+        self.top_n_patches     = top_n_patches
+        self.cluster_threshold = cluster_threshold
+        self.bce_lambda        = bce_lambda
+        self.max_tokens        = max_tokens
 
-        # cluster 信息
         self.clusters            = {int(k): v for k, v in cluster_info["clusters"].items()}
         self.feature_to_cluster  = {int(k): int(v) for k, v in cluster_info["feature_to_cluster"].items()}
         self.cluster_to_features = {}
@@ -152,18 +75,15 @@ class QwenWithClusterPredictorAndSAE(nn.Module):
             self.cluster_to_features.setdefault(cid, []).append(fid)
         self.n_clusters = len(self.clusters)
 
-        # ClusterPredictor（可训练）
         hidden_dim = base_model.config.text_config.hidden_size
         self.cluster_predictor = ClusterPredictor(hidden_dim, self.n_clusters).to(
-            next(base_model.parameters()).device  # 和 base_model 同设备
+            next(base_model.parameters()).device
         )
 
-        # 冻结 SAE
         self.sae.eval()
         for p in self.sae.parameters():
             p.requires_grad = False
 
-        # 冻结 base_model（除了 cluster_predictor）
         for p in self.base_model.parameters():
             p.requires_grad = False
 
@@ -196,7 +116,6 @@ class QwenWithClusterPredictorAndSAE(nn.Module):
         return inputs.to(self.device)
 
     def _get_token_positions(self, inputs):
-        """获取 image token 位置和 text token 位置。"""
         image_grid      = inputs["image_grid_thw"]
         H_grid          = image_grid[0, 1].item()
         W_grid          = image_grid[0, 2].item()
@@ -206,7 +125,6 @@ class QwenWithClusterPredictorAndSAE(nn.Module):
         input_ids       = inputs["input_ids"][0]
         vision_pos      = (input_ids == vision_start_id).nonzero()[0].item() + 1
 
-        # text token 位置（排除 image token 和特殊 token）
         special_ids = {
             self.processor.tokenizer.convert_tokens_to_ids(t)
             for t in ["<|im_start|>", "<|im_end|>", "<|vision_start|>", "<|vision_end|>"]
@@ -220,41 +138,37 @@ class QwenWithClusterPredictorAndSAE(nn.Module):
 
         return vision_pos, num_img_tokens, text_positions
 
-    # ── 获取 layer N 之前的 hidden state ─────────────────────────────────────
-
     def _get_hidden_before_layer(self, inputs, layer_idx: int):
-        """
-        获取 inject_layer 之前（即 layer_idx - 1 输出）的 hidden state。
-        用 output_hidden_states=True，取 hidden_states[layer_idx]。
-        注意：hidden_states[0] 是 embedding，hidden_states[i] 是第 i 层的输出。
-        """
         with torch.no_grad():
             outputs = self.base_model(
                 **inputs,
                 output_hidden_states=True,
                 return_dict=True,
             )
-        # hidden_states[inject_layer] = inject_layer 之前那层的输出
         return outputs.hidden_states[layer_idx]
 
-    # ── 找注入操作 ────────────────────────────────────────────────────────────
+    # ── 找 extra patch hidden state ───────────────────────────────────────────
 
-    def _get_inject_ops(self, h: torch.Tensor, cluster_ids: list,
-                        vision_pos: int, num_img_tokens: int) -> list:
+    def _get_extra_tokens(
+        self,
+        h:              torch.Tensor,
+        cluster_ids:    list,
+        vision_pos:     int,
+        num_img_tokens: int,
+    ) -> Optional[torch.Tensor]:
         """
-        用 inject_layer 之前的 hidden state 做 SAE encode，
-        找每个选中 cluster 里激活最强的 patch，构建注入操作。
+        找每个 cluster 激活最强的 patch
+        返回这些 patch 的 layer inject_layer 的 hidden state
+        shape: (K, hidden_dim)
         """
         flat = h[:, vision_pos : vision_pos + num_img_tokens, :].reshape(
             -1, h.shape[-1]
         ).float()
 
         with torch.no_grad():
-            z = self.sae.encode(flat)   # (num_tokens, latent_dim)
+            z = self.sae.encode(flat)
 
-        dec_weight = self.sae.decoder.weight.detach()   # (hidden_dim, latent_dim)
-        all_ops    = []
-
+        all_ops = []
         for cid in cluster_ids:
             fids = self.cluster_to_features.get(cid, [])
             for fid in fids:
@@ -263,17 +177,96 @@ class QwenWithClusterPredictorAndSAE(nn.Module):
                 patch_acts = z[:, fid]
                 if patch_acts.max().item() <= 0:
                     continue
-                top_patch   = patch_acts.argmax().item()
-                strength    = float(patch_acts[top_patch])
-                feature_dir = dec_weight[:, fid]
-                all_ops.append((strength, top_patch, feature_dir))
+                top_patch = patch_acts.argmax().item()
+                strength  = float(patch_acts[top_patch])
+                all_ops.append((strength, top_patch))
 
-        # 按激活强度降序，取 top_n_patches
+        if not all_ops:
+            return None
+
         all_ops.sort(key=lambda x: x[0], reverse=True)
         all_ops = all_ops[:self.top_n_patches]
 
-        return [(patch_idx, feature_dir, strength)
-                for strength, patch_idx, feature_dir in all_ops]
+        patch_indices = [idx for _, idx in all_ops]
+        extra_hidden  = flat[patch_indices].detach()   # (K, hidden_dim)
+        return extra_hidden
+
+    # ── 构建 inputs_embeds + 扩展 attention_mask 和 labels ───────────────────
+
+    def _build_with_extra(
+        self,
+        inputs:       dict,
+        extra_hidden: torch.Tensor,
+        vision_pos:   int,
+        num_img_tokens: int,
+        labels:       Optional[torch.Tensor] = None,
+    ):
+        """
+        在 inputs_embeds 层把 extra token concat 到 image token 后面。
+        同步扩展 attention_mask 和 labels。
+
+        Returns:
+            dict：可直接传给 base_model 的 kwargs
+        """
+        input_ids      = inputs["input_ids"]
+        attention_mask = inputs.get("attention_mask")
+
+        # 获取 inputs_embeds（通过 embedding 层）
+        with torch.no_grad():
+            inputs_embeds = self.base_model.model.language_model.embed_tokens(input_ids)
+
+        extra     = extra_hidden.to(inputs_embeds.device).to(inputs_embeds.dtype)
+        extra     = extra.unsqueeze(0)             # (1, K, hidden_dim)
+        insert_pos = vision_pos + num_img_tokens
+        extra_len  = extra.shape[1]
+
+        # concat extra token 到 image token 后面
+        inputs_embeds_new = torch.cat([
+            inputs_embeds[:, :insert_pos, :],
+            extra,
+            inputs_embeds[:, insert_pos:, :],
+        ], dim=1)
+
+        # 扩展 attention_mask
+        attention_mask_new = None
+        if attention_mask is not None:
+            extra_mask = torch.ones(
+                attention_mask.shape[0], extra_len,
+                dtype=attention_mask.dtype, device=attention_mask.device
+            )
+            attention_mask_new = torch.cat([
+                attention_mask[:, :insert_pos],
+                extra_mask,
+                attention_mask[:, insert_pos:],
+            ], dim=1)
+
+        # 扩展 labels
+        labels_new = None
+        if labels is not None:
+            extra_labels = torch.full(
+                (labels.shape[0], extra_len), -100,
+                dtype=labels.dtype, device=labels.device
+            )
+            labels_new = torch.cat([
+                labels[:, :insert_pos],
+                extra_labels,
+                labels[:, insert_pos:],
+            ], dim=1)
+
+        kwargs = {
+            "inputs_embeds": inputs_embeds_new,
+            "attention_mask": attention_mask_new,
+        }
+        # 不传 input_ids，用 inputs_embeds 替代
+        # 传递其他必要的字段
+        for k, v in inputs.items():
+            if k not in ["input_ids", "attention_mask", "inputs_embeds"]:
+                kwargs[k] = v
+
+        if labels_new is not None:
+            kwargs["labels"] = labels_new
+
+        return kwargs, extra_len   # ← 同时返回 extra_len，方便后续计算偏移
 
     # ── 训练 loss ─────────────────────────────────────────────────────────────
 
@@ -284,17 +277,28 @@ class QwenWithClusterPredictorAndSAE(nn.Module):
         answer:         str,
         focus_clusters: list,
     ):
-        """
-        联合训练：
-            BCE loss：cluster 预测
-            LM loss： 注入增强后生成答案
-            total = LM loss + bce_lambda * BCE loss
-        """
         from qwen_vl_utils import process_vision_info
 
         inputs = self._build_inputs(image_path, question, for_generation=False)
+        vision_pos, num_img_tokens, text_positions = self._get_token_positions(inputs)
+        h_before = self._get_hidden_before_layer(inputs, self.inject_layer)
 
-        # 加上答案的 inputs（用于 LM loss）
+        # ClusterPredictor 前向（需要梯度）
+        logits = self.cluster_predictor(h_before, text_positions)
+
+        # BCE loss
+        target = torch.zeros(1, self.n_clusters, device=self.device)
+        for cid in focus_clusters:
+            if 0 <= cid < self.n_clusters:
+                target[0, cid] = 1.0
+        bce_loss = F.binary_cross_entropy_with_logits(logits, target)
+
+        # 找 extra token
+        extra_hidden = self._get_extra_tokens(
+            h_before, focus_clusters, vision_pos, num_img_tokens
+        )
+
+        # 构建带答案的 inputs
         messages = [[{
             "role": "user",
             "content": [
@@ -319,44 +323,18 @@ class QwenWithClusterPredictorAndSAE(nn.Module):
 
         labels = self._build_labels(inputs_with_ans["input_ids"])
 
-        # 获取 inject_layer 之前的 hidden state
-        vision_pos, num_img_tokens, text_positions = self._get_token_positions(inputs)
-        h_before = self._get_hidden_before_layer(inputs, self.inject_layer)
+        if extra_hidden is not None and len(extra_hidden) > 0:
+            kwargs, _ = self._build_with_extra(
+                inputs_with_ans, extra_hidden, vision_pos, num_img_tokens, labels
+            )
+        else:
+            kwargs = dict(inputs_with_ans)
+            kwargs["labels"] = labels
 
-        # ClusterPredictor 前向（可训练，需要梯度）
-        logits = self.cluster_predictor(h_before, text_positions)   # (1, n_clusters)
-
-        # BCE loss
-        target = torch.zeros(1, self.n_clusters, device=self.device)
-        for cid in focus_clusters:
-            if 0 <= cid < self.n_clusters:
-                target[0, cid] = 1.0
-        bce_loss = F.binary_cross_entropy_with_logits(logits, target)
-
-        # 用预测的 cluster 找注入操作（推理时用预测，训练时用真实 label）
-        pred_clusters = (torch.sigmoid(logits[0]) > self.cluster_threshold).nonzero(
-            as_tuple=False
-        ).squeeze(-1).tolist()
-        # 训练时用 ground truth cluster（更稳定）
-        inject_ops = self._get_inject_ops(
-            h_before, focus_clusters, vision_pos, num_img_tokens
-        )
-
-        # 注入后的 LM loss
-        target_layer = self.base_model.model.language_model.layers[self.inject_layer]
-        hook = PatchInjectionHook(
-            inject_ops, vision_pos, num_img_tokens, self.inject_scale
-        )
-        hook.register(target_layer)
-
-        try:
-            outputs  = self.base_model(**inputs_with_ans, labels=labels, return_dict=True)
-            lm_loss  = outputs.loss
-        finally:
-            hook.remove()
+        outputs = self.base_model(**kwargs, return_dict=True)
+        lm_loss = outputs.loss
 
         total_loss = lm_loss + self.bce_lambda * bce_loss
-
         return total_loss, lm_loss.item(), bce_loss.item()
 
     def _build_labels(self, input_ids: torch.Tensor) -> torch.Tensor:
@@ -383,31 +361,21 @@ class QwenWithClusterPredictorAndSAE(nn.Module):
 
     @torch.no_grad()
     def generate(self, image_path: str, question: str, verbose: bool = False) -> dict:
-        """单次 forward 推理。"""
         inputs = self._build_inputs(image_path, question, for_generation=True)
         vision_pos, num_img_tokens, text_positions = self._get_token_positions(inputs)
-
-        # 获取 inject_layer 之前的 hidden state
         h_before = self._get_hidden_before_layer(inputs, self.inject_layer)
 
         # ClusterPredictor 预测
-        logits       = self.cluster_predictor(h_before, text_positions)
-        probs        = torch.sigmoid(logits[0])
-        cluster_ids  = (probs > self.cluster_threshold).nonzero(
+        logits      = self.cluster_predictor(h_before, text_positions)
+        probs       = torch.sigmoid(logits[0])
+        cluster_ids = (probs > self.cluster_threshold).nonzero(
             as_tuple=False
         ).squeeze(-1).tolist()
 
+        cluster_names = [self.clusters[c]["name"] for c in cluster_ids if c in self.clusters]
+
         if verbose:
-            cluster_names = [self.clusters[c]["name"] for c in cluster_ids if c in self.clusters]
             print(f"  Predicted clusters: {cluster_ids} → {cluster_names}")
-
-        # 找注入操作
-        inject_ops = self._get_inject_ops(
-            h_before, cluster_ids, vision_pos, num_img_tokens
-        )
-
-        if verbose:
-            print(f"  Inject ops: {len(inject_ops)} (max {self.top_n_patches})")
 
         # base answer（不注入）
         base_output_ids = self.base_model.generate(
@@ -418,26 +386,60 @@ class QwenWithClusterPredictorAndSAE(nn.Module):
             base_output_ids[0, input_len:], skip_special_tokens=True
         ).strip()
 
-        # 注入后的 answer
-        if inject_ops:
-            target_layer = self.base_model.model.language_model.layers[self.inject_layer]
-            hook = PatchInjectionHook(
-                inject_ops, vision_pos, num_img_tokens, self.inject_scale
+        if not cluster_ids:
+            return {
+                "cluster_ids":   [],
+                "cluster_names": [],
+                "base_answer":   base_answer,
+                "final_answer":  base_answer,
+            }
+
+        # 找 extra token
+        extra_hidden = self._get_extra_tokens(
+            h_before, cluster_ids, vision_pos, num_img_tokens
+        )
+
+        if verbose:
+            k = len(extra_hidden) if extra_hidden is not None else 0
+            print(f"  Extra tokens: {k} (max {self.top_n_patches})")
+
+        # ── 注入后推理（修复解码偏移） ────────────────────────────────────────
+        if extra_hidden is not None and len(extra_hidden) > 0:
+            kwargs, extra_len = self._build_with_extra(
+                inputs, extra_hidden, vision_pos, num_img_tokens
             )
-            hook.register(target_layer)
-            try:
-                output_ids = self.base_model.generate(
-                    **inputs, max_new_tokens=self.max_tokens, do_sample=False,
-                )
-                final_answer = self.processor.decode(
-                    output_ids[0, input_len:], skip_special_tokens=True
-                ).strip()
-            finally:
-                hook.remove()
+
+            output_ids = self.base_model.generate(
+                **kwargs, max_new_tokens=self.max_tokens, do_sample=False,
+            )
+
+            # ── 关键修复 ──────────────────────────────────────────────────────
+            # 用 inputs_embeds 调 generate() 时，Qwen 返回的 output_ids
+            # 前面会填充 embed_len 个 dummy token id（通常是 0）。
+            # 但 embed_len = 原始 input_ids 长度 + extra_len，
+            # 所以正确的切分方式是：原始长度 + extra_len。
+            original_input_len = inputs["input_ids"].shape[1]
+            prefix_len = original_input_len + extra_len
+
+            if verbose:
+                print(f"  output_ids.shape={output_ids.shape}, "
+                      f"original_input_len={original_input_len}, "
+                      f"extra_len={extra_len}, prefix_len={prefix_len}")
+
+            if output_ids.shape[1] > prefix_len:
+                generated_ids = output_ids[0, prefix_len:]
+            elif output_ids.shape[1] > original_input_len:
+                # 回退：也许 generate 没有把 extra token 算进去
+                generated_ids = output_ids[0, original_input_len:]
+            else:
+                # 最后兜底：整个 output 都是生成的
+                generated_ids = output_ids[0]
+
+            final_answer = self.processor.decode(
+                generated_ids, skip_special_tokens=True
+            ).strip()
         else:
             final_answer = base_answer
-
-        cluster_names = [self.clusters[c]["name"] for c in cluster_ids if c in self.clusters]
 
         return {
             "cluster_ids":   cluster_ids,
@@ -448,8 +450,6 @@ class QwenWithClusterPredictorAndSAE(nn.Module):
 
     def forward(self, **kwargs):
         return self.base_model(**kwargs)
-
-    # ── 保存 / 加载 ───────────────────────────────────────────────────────────
 
     def save_predictor(self, path: str):
         torch.save(self.cluster_predictor.state_dict(), path)
@@ -471,7 +471,6 @@ class QwenWithClusterPredictorAndSAE(nn.Module):
         inject_layer:      int   = 8,
         latent_mult:       int   = 8,
         topk:              int   = 32,
-        inject_scale:      float = 0.3,
         top_n_patches:     int   = 60,
         cluster_threshold: float = 0.5,
         bce_lambda:        float = 0.5,
@@ -500,15 +499,14 @@ class QwenWithClusterPredictorAndSAE(nn.Module):
             cluster_info = json.load(f)
 
         model = cls(
-            base_model         = base_model,
-            sae                = sae,
-            processor          = processor,
-            cluster_info       = cluster_info,
-            inject_layer       = inject_layer,
-            inject_scale       = inject_scale,
-            top_n_patches      = top_n_patches,
-            cluster_threshold  = cluster_threshold,
-            bce_lambda         = bce_lambda,
+            base_model        = base_model,
+            sae               = sae,
+            processor         = processor,
+            cluster_info      = cluster_info,
+            inject_layer      = inject_layer,
+            top_n_patches     = top_n_patches,
+            cluster_threshold = cluster_threshold,
+            bce_lambda        = bce_lambda,
         )
 
         if predictor_ckpt and os.path.exists(predictor_ckpt):
