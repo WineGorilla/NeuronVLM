@@ -3,12 +3,11 @@
 
 用法：
     python src/inference.py \
-        --image data/images/train2014/COCO_train2014_000000091360.jpg \
-        --question "What might the man and child be feeling when they fly the butterfly kite together?"
-        --predictor_ckpt outputs/focus_ckpt/predictor_best.pt \
-        --qwen_ckpt outputs/focus_ckpt/qwen_best.pt
+        --image data/images/train2014/COCO_train2014_000000536412.jpg \
+        --question "What might be the reason behind the mother zebra's behavior?"
 
-    # 指定两个阶段的权重
+
+data/images/train2014/COCO_train2014_000000416767
     python src/inference.py \
         --image xxx.jpg \
         --question "..." \

@@ -1,13 +1,19 @@
 """
-两阶段训练：
+两阶段训练 - Latent Semantic Injection v2
 
 阶段1：python -m src.train_focus --stage 1
-    冻结 Qwen + SAE，只训练 ClusterPredictor
-    loss = BCE loss
+    冻结 Qwen + SAE + ExtraProjector
+    训练 ClusterPredictor + ImageClusterScorer
+    loss = BCE + λ_align * alignment
+    → 学会选 cluster，且 question↔image 一致
 
 阶段2：python -m src.train_focus --stage 2 --resume best
-    冻结 ClusterPredictor + SAE，解冻 Qwen 最后8层
-    loss = LM loss（concat extra token 后）
+    冻结 SAE
+    联合训练所有可学习模块（分组 LR）：
+        - ExtraProjector + Qwen 后8层：LR = 1e-5（主力）
+        - ClusterPredictor + ImageClusterScorer：LR = 1e-5（持续微调）
+    loss = LM + λ_bce * BCE + λ_align * alignment
+    → 端到端：cluster 选择 + 投影 + 生成 全部联合优化
 """
 import os
 import sys
@@ -24,13 +30,14 @@ from src.Model import QwenWithClusterPredictorAndSAE
 from src.dataset import VisionTextDataset
 
 
-LR_STAGE1  = 1e-4
-LR_STAGE2  = 1e-5
-EPOCHS     = 3
-GRAD_ACCUM = 8
-LOG_EVERY  = 10
-SAVE_EVERY = 500
-SAVE_DIR   = "outputs/focus_ckpt"
+LR_STAGE1      = 1e-4
+LR_STAGE2_MAIN = 1e-5   # Qwen 后8层 + ExtraProjector
+LR_STAGE2_AUX  = 1e-5   # ClusterPredictor + ImageClusterScorer（持续微调）
+EPOCHS         = 3
+GRAD_ACCUM     = 8
+LOG_EVERY      = 10
+SAVE_EVERY     = 500
+SAVE_DIR       = "outputs/focus_ckpt"
 
 
 def main():
@@ -55,6 +62,7 @@ def main():
         top_n_patches     = CFG.top_n_patches,
         cluster_threshold = 0.5,
         bce_lambda        = 0.5,
+        align_lambda      = 0.3,
         predictor_ckpt    = predictor_ckpt,
         device            = CFG.device,
     )
@@ -62,19 +70,27 @@ def main():
     dataset = VisionTextDataset(args.data)
 
     if args.stage == 1:
-        print("Stage 1: Training ClusterPredictor only")
+        # ── Stage 1: ClusterPredictor + ImageClusterScorer ────
+        print("Stage 1: Training ClusterPredictor + ImageClusterScorer")
         for p in model.base_model.parameters():
+            p.requires_grad = False
+        for p in model.extra_projector.parameters():
             p.requires_grad = False
         for p in model.cluster_predictor.parameters():
             p.requires_grad = True
-        params            = list(model.cluster_predictor.parameters())
-        lr                = LR_STAGE1
+        for p in model.image_cluster_scorer.parameters():
+            p.requires_grad = True
+
+        params = (list(model.cluster_predictor.parameters()) +
+                  list(model.image_cluster_scorer.parameters()))
+        optimizer = torch.optim.AdamW(params, lr=LR_STAGE1, weight_decay=1e-4)
         trainable_layer_ids = []
 
     else:
-        print("Stage 2: Fine-tuning Qwen last 8 layers")
-        for p in model.cluster_predictor.parameters():
-            p.requires_grad = False
+        # ── Stage 2: 联合训练，分组 LR ───────────────────────
+        print("Stage 2: Joint training (LM + BCE + alignment)")
+
+        # 冻结 Qwen 全部，再选择性解冻
         for p in model.base_model.parameters():
             p.requires_grad = False
 
@@ -86,15 +102,35 @@ def main():
         for p in model.base_model.lm_head.parameters():
             p.requires_grad = True
 
-        params = [p for p in model.base_model.parameters() if p.requires_grad]
-        lr     = LR_STAGE2
+        # 解冻所有可学习模块
+        for p in model.extra_projector.parameters():
+            p.requires_grad = True
+        for p in model.cluster_predictor.parameters():
+            p.requires_grad = True
+        for p in model.image_cluster_scorer.parameters():
+            p.requires_grad = True
+
+        # 分组 LR
+        param_groups = [
+            {
+                "params": [p for p in model.base_model.parameters() if p.requires_grad] +
+                          list(model.extra_projector.parameters()),
+                "lr": LR_STAGE2_MAIN,
+                "name": "main",
+            },
+            {
+                "params": list(model.cluster_predictor.parameters()) +
+                          list(model.image_cluster_scorer.parameters()),
+                "lr": LR_STAGE2_AUX,
+                "name": "aux",
+            },
+        ]
+        optimizer = torch.optim.AdamW(param_groups, weight_decay=1e-4)
+        params = [p for g in param_groups for p in g["params"]]
 
     trainable = sum(p.numel() for p in params)
     print(f"Dataset   : {len(dataset)} samples")
     print(f"Trainable : {trainable:,} params")
-    print(f"LR        : {lr}")
-
-    optimizer = torch.optim.AdamW(params, lr=lr, weight_decay=1e-4)
 
     # ── 保存函数 ──────────────────────────────────────────────
     def save(tag: str):
@@ -102,7 +138,8 @@ def main():
             path = os.path.join(SAVE_DIR, f"predictor_{tag}.pt")
             model.save_predictor(path)
         else:
-            path  = os.path.join(SAVE_DIR, f"qwen_{tag}.pt")
+            # 保存 Qwen 微调层
+            qwen_path = os.path.join(SAVE_DIR, f"qwen_{tag}.pt")
             state = {
                 k: v for k, v in model.base_model.state_dict().items()
                 if any(
@@ -111,8 +148,12 @@ def main():
                 )
                 or k.startswith("lm_head.")
             }
-            torch.save(state, path)
-            print(f"  saved: {path}")
+            torch.save(state, qwen_path)
+            print(f"  saved: {qwen_path}")
+
+            # 保存 predictor + scorer + projector
+            pred_path = os.path.join(SAVE_DIR, f"predictor_{tag}.pt")
+            model.save_predictor(pred_path)
 
     def handle_sigint(sig, frame):
         print("\n[interrupted] saving...")
@@ -141,38 +182,43 @@ def main():
             item = dataset[idx]
             try:
                 if args.stage == 1:
-                    # 阶段1：只算 BCE loss
+                    # ── 阶段1：BCE + alignment ───────────────────────
                     inputs = model._build_inputs(
                         item["image"], item["question"], for_generation=False
                     )
                     vision_pos, num_img_tokens, text_positions = \
                         model._get_token_positions(inputs)
-                    h_before   = model._get_hidden_at_layer(inputs, model.inject_layer)
-                    logits     = model.cluster_predictor(h_before, text_positions)
+                    h = model._get_hidden_at_layer(inputs, model.inject_layer)
 
+                    logits = model.cluster_predictor(h, text_positions)
                     target = torch.zeros(1, model.n_clusters, device=model.device)
                     for cid in item.get("focus_clusters", []):
                         if 0 <= cid < model.n_clusters:
                             target[0, cid] = 1.0
+                    bce_loss = F.binary_cross_entropy_with_logits(logits, target)
 
-                    total_loss = F.binary_cross_entropy_with_logits(logits, target)
+                    h_vision = h[0, vision_pos:vision_pos + num_img_tokens, :].float()
+                    align_loss = model._compute_alignment_loss(h_vision, logits)
+
+                    total_loss = bce_loss + model.align_lambda * align_loss
 
                     if step % LOG_EVERY == 0:
-                        print(f"  step {step:5d} | bce={total_loss.item():.4f}")
+                        print(f"  step {step:5d} | bce={bce_loss.item():.4f} "
+                              f"align={align_loss.item():.4f}")
 
                 else:
-                    # 阶段2：只算 LM loss（concat extra token 后）
-                    total_loss, lm_loss, bce_loss = model.compute_loss(
+                    # ── 阶段2：LM + BCE + alignment ──────────────────
+                    total_loss, lm_loss, bce_loss_val = model.compute_loss(
                         image_path     = item["image"],
                         question       = item["question"],
                         answer         = item["answer"],
                         focus_clusters = item.get("focus_clusters", []),
+                        include_bce    = True,
                     )
-                    # 阶段2只用 lm_loss，去掉 bce 部分
-                    total_loss = total_loss - model.bce_lambda * bce_loss
 
                     if step % LOG_EVERY == 0:
-                        print(f"  step {step:5d} | lm={lm_loss:.4f} bce={bce_loss:.4f}")
+                        print(f"  step {step:5d} | total={total_loss.item():.4f} "
+                              f"lm={lm_loss:.4f} bce={bce_loss_val:.4f}")
 
                 loss = total_loss / GRAD_ACCUM
 

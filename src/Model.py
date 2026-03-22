@@ -1,24 +1,17 @@
 """
-QwenWithClusterPredictorAndSAE：完整模型。
+QwenWithClusterPredictorAndSAE - Latent Semantic Injection v2
 
-架构：
-    1. 获取 layer 8 的 hidden state（hidden_states[layer+1]，与 SAE 训练一致）
-    2. ClusterPredictor 预测需要关注的 cluster
-    3. SAE encode → 找每个 cluster 激活最强的 patch
-    4. 把这些 patch 的 hidden state 作为 extra token
-       直接在 inputs_embeds 层 concat 到 image token 后面
-    5. 用 inputs_embeds 调用模型 → 所有 attention/mask 自动对齐
-    6. 生成答案
+核心改进：
+    1. ExtraProjector: hidden state → embedding space (修复 216x 空间不匹配)
+    2. Soft Weighted Sum: 不再选 top-K patch，而是对所有 patch 加权求和
+       extra = Σ (patch_hidden * cluster_weight)  → 连续控制，不是 hard routing
+    3. Image-Cluster Alignment: question→cluster 和 image→cluster 必须一致
 
-核心思想：
-    在 embedding 层操作，不需要 hook
-    extra token 的 hidden state 来自正确的层（和 SAE 训练时一致）
-    所有下游计算自动对齐，不会有维度不匹配问题
-
-关键修复记录：
-    - hidden_states 索引：train.py 用 hidden_states[l+1]，本文件已对齐
-    - generate 解码偏移：inputs_embeds 模式下正确计算 prefix_len
-    - _build_with_extra 返回 (kwargs, extra_len) 方便偏移计算
+Architecture:
+    h_vision → SAE encode → z (sparse features)
+    per cluster: weight_c = Σ z[:, fids] → softmax over patches → weighted sum
+    extra_tokens = [weighted_sum_cluster_0, weighted_sum_cluster_1, ...]
+    → ExtraProjector → embedding space → inject → LM decode
 """
 import os
 import json
@@ -47,6 +40,44 @@ class ClusterPredictor(nn.Module):
         return self.head(q)
 
 
+# ── Image-based Cluster Scorer ────────────────────────────────────────────────
+
+class ImageClusterScorer(nn.Module):
+    """
+    从 image hidden state 预测 cluster 分布。
+    用于 alignment loss：question→cluster 和 image→cluster 要一致。
+    """
+    def __init__(self, hidden_dim: int, n_clusters: int):
+        super().__init__()
+        self.head = nn.Sequential(
+            nn.Linear(hidden_dim, hidden_dim // 2),
+            nn.ReLU(),
+            nn.Linear(hidden_dim // 2, n_clusters),
+        )
+
+    def forward(self, h_vision: torch.Tensor) -> torch.Tensor:
+        """
+        h_vision: (num_patches, hidden_dim)
+        returns: (1, n_clusters) logits
+        """
+        pooled = h_vision.float().mean(dim=0, keepdim=True)
+        return self.head(pooled)
+
+
+# ── Extra Token 投影层 ────────────────────────────────────────────────────────
+
+class ExtraProjector(nn.Module):
+    """将 hidden state 空间投影到 embedding 空间"""
+    def __init__(self, hidden_dim: int):
+        super().__init__()
+        self.norm = nn.LayerNorm(hidden_dim)
+        self.proj = nn.Linear(hidden_dim, hidden_dim, bias=False)
+        nn.init.normal_(self.proj.weight, std=0.01)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return self.proj(self.norm(x))
+
+
 # ── 完整模型 ──────────────────────────────────────────────────────────────────
 
 class QwenWithClusterPredictorAndSAE(nn.Module):
@@ -61,6 +92,7 @@ class QwenWithClusterPredictorAndSAE(nn.Module):
         top_n_patches:     int   = 60,
         cluster_threshold: float = 0.5,
         bce_lambda:        float = 0.5,
+        align_lambda:      float = 0.3,
         max_tokens:        int   = 128,
     ):
         super().__init__()
@@ -71,6 +103,7 @@ class QwenWithClusterPredictorAndSAE(nn.Module):
         self.top_n_patches     = top_n_patches
         self.cluster_threshold = cluster_threshold
         self.bce_lambda        = bce_lambda
+        self.align_lambda      = align_lambda
         self.max_tokens        = max_tokens
 
         self.clusters            = {int(k): v for k, v in cluster_info["clusters"].items()}
@@ -81,14 +114,15 @@ class QwenWithClusterPredictorAndSAE(nn.Module):
         self.n_clusters = len(self.clusters)
 
         hidden_dim = base_model.config.text_config.hidden_size
-        self.cluster_predictor = ClusterPredictor(hidden_dim, self.n_clusters).to(
-            next(base_model.parameters()).device
-        )
+        device     = next(base_model.parameters()).device
+
+        self.cluster_predictor   = ClusterPredictor(hidden_dim, self.n_clusters).to(device)
+        self.image_cluster_scorer = ImageClusterScorer(hidden_dim, self.n_clusters).to(device)
+        self.extra_projector     = ExtraProjector(hidden_dim).to(device)
 
         self.sae.eval()
         for p in self.sae.parameters():
             p.requires_grad = False
-
         for p in self.base_model.parameters():
             p.requires_grad = False
 
@@ -110,6 +144,31 @@ class QwenWithClusterPredictorAndSAE(nn.Module):
         texts = [
             self.processor.apply_chat_template(
                 m, tokenize=False, add_generation_prompt=for_generation
+            )
+            for m in messages
+        ]
+        image_inputs, video_inputs = process_vision_info(messages)
+        inputs = self.processor(
+            text=texts, images=image_inputs, videos=video_inputs,
+            padding=True, return_tensors="pt",
+        )
+        return inputs.to(self.device)
+
+    def _build_inputs_with_answer(self, image_path: str, question: str, answer: str):
+        from qwen_vl_utils import process_vision_info
+        messages = [[{
+            "role": "user",
+            "content": [
+                {"type": "image", "image": image_path},
+                {"type": "text",  "text":  question},
+            ],
+        }, {
+            "role":    "assistant",
+            "content": answer,
+        }]]
+        texts = [
+            self.processor.apply_chat_template(
+                m, tokenize=False, add_generation_prompt=False
             )
             for m in messages
         ]
@@ -144,74 +203,95 @@ class QwenWithClusterPredictorAndSAE(nn.Module):
         return vision_pos, num_img_tokens, text_positions
 
     def _get_hidden_at_layer(self, inputs, layer_idx: int):
-        """
-        获取指定 transformer layer 的输出 hidden state。
-
-        ★ 关键对齐 ★
-        output_hidden_states 返回 num_layers + 1 个张量：
-            hidden_states[0]       = embedding 层输出
-            hidden_states[1]       = transformer layer 0 的输出
-            hidden_states[l + 1]   = transformer layer l 的输出
-
-        train.py (SAE 训练) 中使用:
-            h = outputs.hidden_states[l + 1]    # l 来自 CFG.layers = [8]
-
-        所以这里也用 hidden_states[layer_idx + 1]，保证 SAE encode
-        拿到的 hidden state 和训练时完全一致。
-        """
         with torch.no_grad():
             outputs = self.base_model(
-                **inputs,
-                output_hidden_states=True,
-                return_dict=True,
+                **inputs, output_hidden_states=True, return_dict=True,
             )
         return outputs.hidden_states[layer_idx + 1]
 
-    # ── 找 extra patch hidden state ───────────────────────────────────────────
+    # ── Cluster 预测 ──────────────────────────────────────────────────────────
 
-    def _get_extra_tokens(
+    def _predict_clusters(self, h, text_positions):
+        logits = self.cluster_predictor(h, text_positions)
+        probs  = torch.sigmoid(logits.detach())
+        cluster_ids = (probs[0] > self.cluster_threshold).nonzero(
+            as_tuple=False
+        ).squeeze(-1).tolist()
+        return logits, cluster_ids, probs[0]
+
+    # ── Soft Weighted Sum（核心改动）─────────────────────────────────────────
+
+    def _get_extra_tokens_soft(
         self,
         h:              torch.Tensor,
         cluster_ids:    list,
+        cluster_probs:  torch.Tensor,
         vision_pos:     int,
         num_img_tokens: int,
     ) -> Optional[torch.Tensor]:
         """
-        找每个 cluster 激活最强的 patch
-        返回这些 patch 的 hidden state
-        shape: (K, hidden_dim)
+        Soft weighted sum：不选 top-K，而是对每个 cluster 做 weighted sum。
+
+        对每个激活的 cluster c:
+            1. 收集该 cluster 所有 feature 在每个 patch 上的激活值
+            2. 对 patch 维度做 softmax → attention weights
+            3. weighted sum: extra_c = Σ_p (w_p * h_p)
+            4. 乘以 cluster_prob 作为 gate
+
+        返回: (num_active_clusters, hidden_dim)
         """
-        flat = h[:, vision_pos : vision_pos + num_img_tokens, :].reshape(
-            -1, h.shape[-1]
-        ).float()
-
-        with torch.no_grad():
-            z = self.sae.encode(flat)
-
-        all_ops = []
-        for cid in cluster_ids:
-            fids = self.cluster_to_features.get(cid, [])
-            for fid in fids:
-                if fid >= z.shape[-1]:
-                    continue
-                patch_acts = z[:, fid]
-                if patch_acts.max().item() <= 0:
-                    continue
-                top_patch = patch_acts.argmax().item()
-                strength  = float(patch_acts[top_patch])
-                all_ops.append((strength, top_patch))
-
-        if not all_ops:
+        if not cluster_ids:
             return None
 
-        all_ops.sort(key=lambda x: x[0], reverse=True)
-        all_ops = all_ops[:self.top_n_patches]
+        flat = h[:, vision_pos : vision_pos + num_img_tokens, :].reshape(
+            -1, h.shape[-1]
+        )  # (num_patches, hidden_dim)
+        flat_f = flat.float()
 
-        patch_indices = [idx for _, idx in all_ops]
-        extra_hidden  = flat[patch_indices].detach()   # (K, hidden_dim)
-        return extra_hidden
+        with torch.no_grad():
+            z = self.sae.encode(flat_f)  # (num_patches, latent_dim)
 
-    # ── 构建 inputs_embeds + 扩展 attention_mask 和 labels ───────────────────
+        extra_list = []
+        for cid in cluster_ids:
+            fids = self.cluster_to_features.get(cid, [])
+            if not fids:
+                continue
+
+            # 收集该 cluster 所有 feature 的激活，汇总到 patch 级别
+            valid_fids = [f for f in fids if f < z.shape[-1]]
+            if not valid_fids:
+                continue
+
+            # (num_patches, num_features_in_cluster) → sum → (num_patches,)
+            cluster_acts = z[:, valid_fids].sum(dim=-1)
+
+            if cluster_acts.max().item() <= 0:
+                continue
+
+            # softmax over patches → attention weights
+            attn_weights = F.softmax(cluster_acts, dim=0)  # (num_patches,)
+
+            # weighted sum of patch hidden states
+            # attn_weights: (num_patches,) × flat: (num_patches, hidden_dim)
+            weighted = (attn_weights.unsqueeze(-1) * flat_f).sum(dim=0)  # (hidden_dim,)
+
+            # gate by cluster probability
+            if cid < len(cluster_probs):
+                weighted = weighted * float(cluster_probs[cid])
+
+            extra_list.append(weighted)
+
+        if not extra_list:
+            return None
+
+        extra = torch.stack(extra_list, dim=0)  # (num_clusters, hidden_dim)
+
+        # 投影到 embedding 空间
+        extra_projected = self.extra_projector(extra)
+
+        return extra_projected
+
+    # ── 构建 inputs_embeds ────────────────────────────────────────────────────
 
     def _build_with_extra(
         self,
@@ -221,33 +301,23 @@ class QwenWithClusterPredictorAndSAE(nn.Module):
         num_img_tokens: int,
         labels:       Optional[torch.Tensor] = None,
     ):
-        """
-        在 inputs_embeds 层把 extra token concat 到 image token 后面。
-        同步扩展 attention_mask 和 labels。
-
-        Returns:
-            (dict, int)：kwargs 和 extra_len
-        """
         input_ids      = inputs["input_ids"]
         attention_mask = inputs.get("attention_mask")
 
-        # 获取 inputs_embeds（通过 embedding 层）
         with torch.no_grad():
             inputs_embeds = self.base_model.model.language_model.embed_tokens(input_ids)
 
         extra     = extra_hidden.to(inputs_embeds.device).to(inputs_embeds.dtype)
-        extra     = extra.unsqueeze(0)             # (1, K, hidden_dim)
+        extra     = extra.unsqueeze(0)
         insert_pos = vision_pos + num_img_tokens
         extra_len  = extra.shape[1]
 
-        # concat extra token 到 image token 后面
         inputs_embeds_new = torch.cat([
             inputs_embeds[:, :insert_pos, :],
             extra,
             inputs_embeds[:, insert_pos:, :],
         ], dim=1)
 
-        # 扩展 attention_mask
         attention_mask_new = None
         if attention_mask is not None:
             extra_mask = torch.ones(
@@ -260,7 +330,6 @@ class QwenWithClusterPredictorAndSAE(nn.Module):
                 attention_mask[:, insert_pos:],
             ], dim=1)
 
-        # 扩展 labels
         labels_new = None
         if labels is not None:
             extra_labels = torch.full(
@@ -277,16 +346,34 @@ class QwenWithClusterPredictorAndSAE(nn.Module):
             "inputs_embeds": inputs_embeds_new,
             "attention_mask": attention_mask_new,
         }
-        # 不传 input_ids，用 inputs_embeds 替代
-        # 传递其他必要的字段
         for k, v in inputs.items():
             if k not in ["input_ids", "attention_mask", "inputs_embeds"]:
                 kwargs[k] = v
-
         if labels_new is not None:
             kwargs["labels"] = labels_new
 
         return kwargs, extra_len
+
+    # ── Image-Cluster Alignment Loss ──────────────────────────────────────────
+
+    def _compute_alignment_loss(self, h_vision_flat, text_logits):
+        """
+        question→cluster 和 image→cluster 必须一致。
+        用 KL divergence 对齐两个分布。
+        """
+        image_logits = self.image_cluster_scorer(h_vision_flat)
+        text_probs   = torch.sigmoid(text_logits.detach())
+        image_probs  = torch.sigmoid(image_logits)
+
+        # 双向 KL
+        eps = 1e-7
+        text_probs_  = text_probs.clamp(eps, 1 - eps)
+        image_probs_ = image_probs.clamp(eps, 1 - eps)
+
+        kl_forward  = F.kl_div(image_probs_.log(), text_probs_, reduction='batchmean')
+        kl_backward = F.kl_div(text_probs_.log(), image_probs_, reduction='batchmean')
+
+        return (kl_forward + kl_backward) / 2
 
     # ── 训练 loss ─────────────────────────────────────────────────────────────
 
@@ -296,51 +383,39 @@ class QwenWithClusterPredictorAndSAE(nn.Module):
         question:       str,
         answer:         str,
         focus_clusters: list,
+        include_bce:    bool = True,
     ):
-        from qwen_vl_utils import process_vision_info
-
         inputs = self._build_inputs(image_path, question, for_generation=False)
         vision_pos, num_img_tokens, text_positions = self._get_token_positions(inputs)
         h = self._get_hidden_at_layer(inputs, self.inject_layer)
 
-        # ClusterPredictor 前向（需要梯度）
-        logits = self.cluster_predictor(h, text_positions)
+        # Cluster 预测
+        text_logits, pred_cluster_ids, cluster_probs = self._predict_clusters(h, text_positions)
 
-        # BCE loss
-        target = torch.zeros(1, self.n_clusters, device=self.device)
-        for cid in focus_clusters:
-            if 0 <= cid < self.n_clusters:
-                target[0, cid] = 1.0
-        bce_loss = F.binary_cross_entropy_with_logits(logits, target)
+        # BCE loss（Stage 1）
+        bce_loss_val = 0.0
+        bce_loss = torch.tensor(0.0, device=self.device)
+        if include_bce:
+            logits_with_grad = self.cluster_predictor(h, text_positions)
+            target = torch.zeros(1, self.n_clusters, device=self.device)
+            for cid in focus_clusters:
+                if 0 <= cid < self.n_clusters:
+                    target[0, cid] = 1.0
+            bce_loss = F.binary_cross_entropy_with_logits(logits_with_grad, target)
+            bce_loss_val = bce_loss.item()
 
-        # 找 extra token
-        extra_hidden = self._get_extra_tokens(
-            h, focus_clusters, vision_pos, num_img_tokens
+            # Image-Cluster alignment loss（Stage 1 一起训练）
+            h_vision = h[0, vision_pos:vision_pos + num_img_tokens, :].float()
+            align_loss = self._compute_alignment_loss(h_vision, logits_with_grad)
+            bce_loss = bce_loss + self.align_lambda * align_loss
+
+        # Soft weighted sum injection
+        extra_hidden = self._get_extra_tokens_soft(
+            h, pred_cluster_ids, cluster_probs, vision_pos, num_img_tokens
         )
 
         # 构建带答案的 inputs
-        messages = [[{
-            "role": "user",
-            "content": [
-                {"type": "image", "image": image_path},
-                {"type": "text",  "text":  question},
-            ],
-        }, {
-            "role":    "assistant",
-            "content": answer,
-        }]]
-        texts = [
-            self.processor.apply_chat_template(
-                m, tokenize=False, add_generation_prompt=False
-            )
-            for m in messages
-        ]
-        image_inputs, video_inputs = process_vision_info(messages)
-        inputs_with_ans = self.processor(
-            text=texts, images=image_inputs, videos=video_inputs,
-            padding=True, return_tensors="pt",
-        ).to(self.device)
-
+        inputs_with_ans = self._build_inputs_with_answer(image_path, question, answer)
         labels = self._build_labels(inputs_with_ans["input_ids"])
 
         if extra_hidden is not None and len(extra_hidden) > 0:
@@ -354,8 +429,12 @@ class QwenWithClusterPredictorAndSAE(nn.Module):
         outputs = self.base_model(**kwargs, return_dict=True)
         lm_loss = outputs.loss
 
-        total_loss = lm_loss + self.bce_lambda * bce_loss
-        return total_loss, lm_loss.item(), bce_loss.item()
+        if include_bce:
+            total_loss = lm_loss + self.bce_lambda * bce_loss
+        else:
+            total_loss = lm_loss
+
+        return total_loss, lm_loss.item(), bce_loss_val
 
     def _build_labels(self, input_ids: torch.Tensor) -> torch.Tensor:
         labels        = input_ids.clone()
@@ -385,19 +464,14 @@ class QwenWithClusterPredictorAndSAE(nn.Module):
         vision_pos, num_img_tokens, text_positions = self._get_token_positions(inputs)
         h = self._get_hidden_at_layer(inputs, self.inject_layer)
 
-        # ClusterPredictor 预测
-        logits      = self.cluster_predictor(h, text_positions)
-        probs       = torch.sigmoid(logits[0])
-        cluster_ids = (probs > self.cluster_threshold).nonzero(
-            as_tuple=False
-        ).squeeze(-1).tolist()
-
+        _, cluster_ids, cluster_probs = self._predict_clusters(h, text_positions)
         cluster_names = [self.clusters[c]["name"] for c in cluster_ids if c in self.clusters]
 
         if verbose:
             print(f"  Predicted clusters: {cluster_ids} → {cluster_names}")
+            print(f"  Cluster probs: {[f'{cluster_probs[c]:.3f}' for c in cluster_ids]}")
 
-        # base answer（不注入）
+        # base answer
         base_output_ids = self.base_model.generate(
             **inputs, max_new_tokens=self.max_tokens, do_sample=False,
         )
@@ -408,38 +482,31 @@ class QwenWithClusterPredictorAndSAE(nn.Module):
 
         if not cluster_ids:
             return {
-                "cluster_ids":   [],
-                "cluster_names": [],
-                "base_answer":   base_answer,
-                "final_answer":  base_answer,
+                "cluster_ids": [], "cluster_names": [],
+                "base_answer": base_answer, "final_answer": base_answer,
             }
 
-        # 找 extra token
-        extra_hidden = self._get_extra_tokens(
-            h, cluster_ids, vision_pos, num_img_tokens
+        # Soft weighted sum
+        extra_hidden = self._get_extra_tokens_soft(
+            h, cluster_ids, cluster_probs, vision_pos, num_img_tokens
         )
 
         if verbose:
             k = len(extra_hidden) if extra_hidden is not None else 0
-            print(f"  Extra tokens: {k} (max {self.top_n_patches})")
+            print(f"  Extra tokens: {k} (one per active cluster)")
 
-        # ── 注入后推理 ────────────────────────────────────────────────────────
         if extra_hidden is not None and len(extra_hidden) > 0:
             kwargs, extra_len = self._build_with_extra(
                 inputs, extra_hidden, vision_pos, num_img_tokens
             )
-
             output_ids = self.base_model.generate(
                 **kwargs, max_new_tokens=self.max_tokens, do_sample=False,
             )
-
             original_input_len = inputs["input_ids"].shape[1]
             prefix_len = original_input_len + extra_len
 
             if verbose:
-                print(f"  output_ids.shape={output_ids.shape}, "
-                      f"original_input_len={original_input_len}, "
-                      f"extra_len={extra_len}, prefix_len={prefix_len}")
+                print(f"  output_ids.shape={output_ids.shape}, prefix_len={prefix_len}")
 
             if output_ids.shape[1] > prefix_len:
                 generated_ids = output_ids[0, prefix_len:]
@@ -464,16 +531,34 @@ class QwenWithClusterPredictorAndSAE(nn.Module):
     def forward(self, **kwargs):
         return self.base_model(**kwargs)
 
+    # ── 保存 / 加载 ──────────────────────────────────────────────────────────
+
     def save_predictor(self, path: str):
-        torch.save(self.cluster_predictor.state_dict(), path)
-        print(f"  ClusterPredictor saved: {path}")
+        state = {
+            "cluster_predictor":    self.cluster_predictor.state_dict(),
+            "image_cluster_scorer": self.image_cluster_scorer.state_dict(),
+            "extra_projector":      self.extra_projector.state_dict(),
+        }
+        torch.save(state, path)
+        print(f"  Saved predictor+scorer+projector: {path}")
 
     def load_predictor(self, path: str):
-        self.cluster_predictor.load_state_dict(
-            torch.load(path, map_location="cpu")
-        )
+        state = torch.load(path, map_location="cpu")
+
+        if "cluster_predictor" in state:
+            self.cluster_predictor.load_state_dict(state["cluster_predictor"])
+            if "image_cluster_scorer" in state:
+                self.image_cluster_scorer.load_state_dict(state["image_cluster_scorer"])
+            if "extra_projector" in state:
+                self.extra_projector.load_state_dict(state["extra_projector"])
+            print(f"  Loaded predictor+scorer+projector: {path}")
+        else:
+            self.cluster_predictor.load_state_dict(state)
+            print(f"  Loaded predictor (legacy format): {path}")
+
         self.cluster_predictor.to(self.device)
-        print(f"  ClusterPredictor loaded: {path}")
+        self.image_cluster_scorer.to(self.device)
+        self.extra_projector.to(self.device)
 
     @classmethod
     def from_pretrained(
@@ -487,6 +572,7 @@ class QwenWithClusterPredictorAndSAE(nn.Module):
         top_n_patches:     int   = 60,
         cluster_threshold: float = 0.5,
         bce_lambda:        float = 0.5,
+        align_lambda:      float = 0.3,
         predictor_ckpt:    str   = None,
         device:            str   = "cuda",
     ):
@@ -520,12 +606,17 @@ class QwenWithClusterPredictorAndSAE(nn.Module):
             top_n_patches     = top_n_patches,
             cluster_threshold = cluster_threshold,
             bce_lambda        = bce_lambda,
+            align_lambda      = align_lambda,
         )
 
         if predictor_ckpt and os.path.exists(predictor_ckpt):
             model.load_predictor(predictor_ckpt)
 
         model.eval()
-        trainable = sum(p.numel() for p in model.cluster_predictor.parameters())
-        print(f"Model ready. ClusterPredictor trainable params: {trainable:,}")
+        print(f"Model ready. Trainable modules:")
+        for name, mod in [("ClusterPredictor", model.cluster_predictor),
+                          ("ImageClusterScorer", model.image_cluster_scorer),
+                          ("ExtraProjector", model.extra_projector)]:
+            n = sum(p.numel() for p in mod.parameters())
+            print(f"  {name}: {n:,} params")
         return model
