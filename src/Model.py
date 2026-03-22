@@ -2,18 +2,23 @@
 QwenWithClusterPredictorAndSAE：完整模型。
 
 架构：
-    1. 获取 layer 7 的 hidden state
+    1. 获取 layer 8 的 hidden state（hidden_states[layer+1]，与 SAE 训练一致）
     2. ClusterPredictor 预测需要关注的 cluster
     3. SAE encode → 找每个 cluster 激活最强的 patch
-    4. 把这些 patch 的 layer 7 hidden state 作为 extra token
+    4. 把这些 patch 的 hidden state 作为 extra token
        直接在 inputs_embeds 层 concat 到 image token 后面
     5. 用 inputs_embeds 调用模型 → 所有 attention/mask 自动对齐
     6. 生成答案
 
 核心思想：
     在 embedding 层操作，不需要 hook
-    extra token 的 hidden state 来自 layer 7（和 image token 同一空间）
+    extra token 的 hidden state 来自正确的层（和 SAE 训练时一致）
     所有下游计算自动对齐，不会有维度不匹配问题
+
+关键修复记录：
+    - hidden_states 索引：train.py 用 hidden_states[l+1]，本文件已对齐
+    - generate 解码偏移：inputs_embeds 模式下正确计算 prefix_len
+    - _build_with_extra 返回 (kwargs, extra_len) 方便偏移计算
 """
 import os
 import json
@@ -138,14 +143,29 @@ class QwenWithClusterPredictorAndSAE(nn.Module):
 
         return vision_pos, num_img_tokens, text_positions
 
-    def _get_hidden_before_layer(self, inputs, layer_idx: int):
+    def _get_hidden_at_layer(self, inputs, layer_idx: int):
+        """
+        获取指定 transformer layer 的输出 hidden state。
+
+        ★ 关键对齐 ★
+        output_hidden_states 返回 num_layers + 1 个张量：
+            hidden_states[0]       = embedding 层输出
+            hidden_states[1]       = transformer layer 0 的输出
+            hidden_states[l + 1]   = transformer layer l 的输出
+
+        train.py (SAE 训练) 中使用:
+            h = outputs.hidden_states[l + 1]    # l 来自 CFG.layers = [8]
+
+        所以这里也用 hidden_states[layer_idx + 1]，保证 SAE encode
+        拿到的 hidden state 和训练时完全一致。
+        """
         with torch.no_grad():
             outputs = self.base_model(
                 **inputs,
                 output_hidden_states=True,
                 return_dict=True,
             )
-        return outputs.hidden_states[layer_idx]
+        return outputs.hidden_states[layer_idx + 1]
 
     # ── 找 extra patch hidden state ───────────────────────────────────────────
 
@@ -158,7 +178,7 @@ class QwenWithClusterPredictorAndSAE(nn.Module):
     ) -> Optional[torch.Tensor]:
         """
         找每个 cluster 激活最强的 patch
-        返回这些 patch 的 layer inject_layer 的 hidden state
+        返回这些 patch 的 hidden state
         shape: (K, hidden_dim)
         """
         flat = h[:, vision_pos : vision_pos + num_img_tokens, :].reshape(
@@ -206,7 +226,7 @@ class QwenWithClusterPredictorAndSAE(nn.Module):
         同步扩展 attention_mask 和 labels。
 
         Returns:
-            dict：可直接传给 base_model 的 kwargs
+            (dict, int)：kwargs 和 extra_len
         """
         input_ids      = inputs["input_ids"]
         attention_mask = inputs.get("attention_mask")
@@ -266,7 +286,7 @@ class QwenWithClusterPredictorAndSAE(nn.Module):
         if labels_new is not None:
             kwargs["labels"] = labels_new
 
-        return kwargs, extra_len   # ← 同时返回 extra_len，方便后续计算偏移
+        return kwargs, extra_len
 
     # ── 训练 loss ─────────────────────────────────────────────────────────────
 
@@ -281,10 +301,10 @@ class QwenWithClusterPredictorAndSAE(nn.Module):
 
         inputs = self._build_inputs(image_path, question, for_generation=False)
         vision_pos, num_img_tokens, text_positions = self._get_token_positions(inputs)
-        h_before = self._get_hidden_before_layer(inputs, self.inject_layer)
+        h = self._get_hidden_at_layer(inputs, self.inject_layer)
 
         # ClusterPredictor 前向（需要梯度）
-        logits = self.cluster_predictor(h_before, text_positions)
+        logits = self.cluster_predictor(h, text_positions)
 
         # BCE loss
         target = torch.zeros(1, self.n_clusters, device=self.device)
@@ -295,7 +315,7 @@ class QwenWithClusterPredictorAndSAE(nn.Module):
 
         # 找 extra token
         extra_hidden = self._get_extra_tokens(
-            h_before, focus_clusters, vision_pos, num_img_tokens
+            h, focus_clusters, vision_pos, num_img_tokens
         )
 
         # 构建带答案的 inputs
@@ -363,10 +383,10 @@ class QwenWithClusterPredictorAndSAE(nn.Module):
     def generate(self, image_path: str, question: str, verbose: bool = False) -> dict:
         inputs = self._build_inputs(image_path, question, for_generation=True)
         vision_pos, num_img_tokens, text_positions = self._get_token_positions(inputs)
-        h_before = self._get_hidden_before_layer(inputs, self.inject_layer)
+        h = self._get_hidden_at_layer(inputs, self.inject_layer)
 
         # ClusterPredictor 预测
-        logits      = self.cluster_predictor(h_before, text_positions)
+        logits      = self.cluster_predictor(h, text_positions)
         probs       = torch.sigmoid(logits[0])
         cluster_ids = (probs > self.cluster_threshold).nonzero(
             as_tuple=False
@@ -396,14 +416,14 @@ class QwenWithClusterPredictorAndSAE(nn.Module):
 
         # 找 extra token
         extra_hidden = self._get_extra_tokens(
-            h_before, cluster_ids, vision_pos, num_img_tokens
+            h, cluster_ids, vision_pos, num_img_tokens
         )
 
         if verbose:
             k = len(extra_hidden) if extra_hidden is not None else 0
             print(f"  Extra tokens: {k} (max {self.top_n_patches})")
 
-        # ── 注入后推理（修复解码偏移） ────────────────────────────────────────
+        # ── 注入后推理 ────────────────────────────────────────────────────────
         if extra_hidden is not None and len(extra_hidden) > 0:
             kwargs, extra_len = self._build_with_extra(
                 inputs, extra_hidden, vision_pos, num_img_tokens
@@ -413,11 +433,6 @@ class QwenWithClusterPredictorAndSAE(nn.Module):
                 **kwargs, max_new_tokens=self.max_tokens, do_sample=False,
             )
 
-            # ── 关键修复 ──────────────────────────────────────────────────────
-            # 用 inputs_embeds 调 generate() 时，Qwen 返回的 output_ids
-            # 前面会填充 embed_len 个 dummy token id（通常是 0）。
-            # 但 embed_len = 原始 input_ids 长度 + extra_len，
-            # 所以正确的切分方式是：原始长度 + extra_len。
             original_input_len = inputs["input_ids"].shape[1]
             prefix_len = original_input_len + extra_len
 
@@ -429,10 +444,8 @@ class QwenWithClusterPredictorAndSAE(nn.Module):
             if output_ids.shape[1] > prefix_len:
                 generated_ids = output_ids[0, prefix_len:]
             elif output_ids.shape[1] > original_input_len:
-                # 回退：也许 generate 没有把 extra token 算进去
                 generated_ids = output_ids[0, original_input_len:]
             else:
-                # 最后兜底：整个 output 都是生成的
                 generated_ids = output_ids[0]
 
             final_answer = self.processor.decode(

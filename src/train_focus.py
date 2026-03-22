@@ -147,7 +147,7 @@ def main():
                     )
                     vision_pos, num_img_tokens, text_positions = \
                         model._get_token_positions(inputs)
-                    h_before   = model._get_hidden_before_layer(inputs, model.inject_layer)
+                    h_before   = model._get_hidden_at_layer(inputs, model.inject_layer)
                     logits     = model.cluster_predictor(h_before, text_positions)
 
                     target = torch.zeros(1, model.n_clusters, device=model.device)

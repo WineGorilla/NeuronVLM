@@ -3,8 +3,8 @@
 
 用法：
     python src/inference.py \
-        --image data/images/train2014/COCO_train2014_000000423678.jpg \
-        --question "After the tennis match, what behavior between the two main players demonstrates sportsmanship?"
+        --image data/images/train2014/COCO_train2014_000000091360.jpg \
+        --question "What might the man and child be feeling when they fly the butterfly kite together?"
         --predictor_ckpt outputs/focus_ckpt/predictor_best.pt \
         --qwen_ckpt outputs/focus_ckpt/qwen_best.pt
 
