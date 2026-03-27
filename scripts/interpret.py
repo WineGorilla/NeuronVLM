@@ -27,7 +27,7 @@ from config import CFG
 
 ANNOTATOR_MODEL_ID = "Qwen/Qwen2.5-VL-7B-Instruct"
 TOP_N_IMAGES       = 3
-PREVIEW_DIR        = "outputs/feature_previews"   # 标注时保存拼接图的目录
+PREVIEW_DIR        = "newoutputs/feature_previews"   # 标注时保存拼接图的目录
 
 
 # ── 加载标注模型（7B）─────────────────────────────────────────────────────────

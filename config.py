@@ -6,16 +6,16 @@ import torch
 @dataclass
 class Config:
     # 模型
-    model_id: str = "Qwen/Qwen2.5-VL-3B-Instruct"
+    model_id: str = "Qwen/Qwen2.5-VL-7B-Instruct"
 
     # 数据
-    train_file: str = "data/train.jsonl"
+    train_file: str = "data/train_vqa2.jsonl"
 
     # ── SAE 层索引（内部会 +1 以跳过 embedding 层）──────────────
     layers: List[int] = field(default_factory=lambda: [8])
 
     # ── SAE 超参 ──────────────────────────────────────────────
-    latent_mult: int = 16      # latent_dim = hidden_dim * latent_mult
+    latent_mult: int = 32      # latent_dim = hidden_dim * latent_mult
     topk: int = 32           
 
     # ── 训练超参 ──────────────────────────────────────────────

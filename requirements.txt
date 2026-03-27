@@ -10,3 +10,4 @@ anthropic
 scipy
 sentence-transformers 
 scikit-learn
+lmms-eval

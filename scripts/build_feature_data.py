@@ -14,7 +14,7 @@
     }
 
 用法：
-    python data/build_feature_data.py --layer 8 --max 100
+    python scripts/build_feature_data.py --layer 8 --max 100
     python data/build_feature_data.py --layer 8
 """
 import os

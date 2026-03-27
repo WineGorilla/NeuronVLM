@@ -11,3 +11,9 @@ interpret_new.py 是新版根据存储的图片缓存进行挑选feature index
 
 
 cluster_features将SAE中的每个神经元进行聚类，并保存至assets/feature_clusters_layer8.json
+
+# 模型训练
+datasets.py:
+train_focus.py:
+inference.py:
+model.py:
