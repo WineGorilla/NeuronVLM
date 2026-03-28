@@ -4,8 +4,11 @@ CV-Bench 评估脚本。
 用法：
     python eval/eval_cvbench.py --mode base
     python eval/eval_cvbench.py --mode enhanced
+    python eval/eval_cvbench.py --mode finetune_baseline --qwen_ckpt outputs/ablation_baseline/qwen_best.pt
     python eval/eval_cvbench.py --mode both
+    python eval/eval_cvbench.py --mode all --qwen_ckpt outputs/ablation_baseline/qwen_best.pt
     python eval/eval_cvbench.py --mode both --max_samples 50
+    python eval/eval_cvbench.py --mode no_pcs --no_pcs_qwen_ckpt outputs/ablation_no_pcs/qwen_best.pt
 """
 import os
 import sys
@@ -27,9 +30,6 @@ from config import CFG
 # ── Prompt 构造 ───────────────────────────────────────────────────────────────
 
 def build_prompt(prompt: str, choices: list) -> str:
-    """
-    构造带 instruction + 选项列表的 prompt，引导模型只输出字母。
-    """
     choice_text = "\n".join(
         [f"{chr(ord('A') + i)}. {c}" for i, c in enumerate(choices)]
     )
@@ -44,37 +44,22 @@ def build_prompt(prompt: str, choices: list) -> str:
 # ── 答案匹配 ──────────────────────────────────────────────────────────────────
 
 def extract_choice_letter(response: str) -> str | None:
-    """
-    从模型输出中提取选项字母，返回 '(A)' 格式或 None。
-    """
-    # 去 CoT：只看第一行
     text = response.strip().split("\n")[0].strip().upper()
     if not text:
         return None
-
-    # "(A)" / "(B)"
     m = re.search(r'\(([A-D])\)', text)
     if m:
         return f"({m.group(1)})"
-
-    # "Answer: A" / "answer is B" / "option C"
     m = re.search(r'(?:ANSWER|OPTION)\s*(?:IS|:)?\s*\(?([A-D])\)?', text)
     if m:
         return f"({m.group(1)})"
-
-    # 开头单字母: "A" / "A." / "A,"
     m = re.match(r'^([A-D])(?:[\s.,):]|$)', text)
     if m:
         return f"({m.group(1)})"
-
     return None
 
 
 def match_by_content(response: str, choices: list) -> str | None:
-    """
-    当提取不到字母时，用选项内容做精确匹配。
-    只有 response 完全等于某个选项内容时才匹配（避免 substring 虚高）。
-    """
     resp = response.strip().split("\n")[0].strip().lower()
     for i, choice in enumerate(choices):
         if resp == str(choice).strip().lower():
@@ -83,25 +68,19 @@ def match_by_content(response: str, choices: list) -> str | None:
 
 
 def match_answer(response: str, choices: list, answer: str) -> tuple[bool, str | None]:
-    """
-    判断模型输出是否正确。返回 (correct, extracted_letter)。
-    策略：字母提取 → 精确内容匹配 → 判错
-    """
     extracted = extract_choice_letter(response)
     if extracted is not None:
         return extracted == answer, extracted
-
     extracted = match_by_content(response, choices)
     if extracted is not None:
         return extracted == answer, extracted
-
     return False, None
 
 
 # ── 加载模型 ──────────────────────────────────────────────────────────────────
 
 def load_base_model():
-    """加载原始 Qwen2.5-VL，不附加任何自定义模块。"""
+    """原始 Qwen2.5-VL，无任何改动。"""
     from transformers import Qwen2_5_VLForConditionalGeneration, AutoProcessor
 
     print("Loading vanilla Qwen2.5-VL for baseline...")
@@ -115,8 +94,34 @@ def load_base_model():
     return base_model, processor
 
 
+def load_finetune_baseline(qwen_ckpt):
+    """原始 Qwen2.5-VL + finetune 过的 top-8 层权重，无 hook / 额外模块。
+    用于 ablation：验证提升来自架构还是数据。
+    """
+    from transformers import Qwen2_5_VLForConditionalGeneration, AutoProcessor
+
+    print("Loading finetune baseline (Qwen + finetuned layers, no hooks)...")
+    processor = AutoProcessor.from_pretrained(CFG.model_id)
+    model = Qwen2_5_VLForConditionalGeneration.from_pretrained(
+        CFG.model_id,
+        torch_dtype=torch.float16,
+        device_map=CFG.device,
+    )
+
+    if qwen_ckpt and os.path.exists(qwen_ckpt):
+        print(f"  Loading finetuned weights: {qwen_ckpt}")
+        state = torch.load(qwen_ckpt, map_location="cpu")
+        model.load_state_dict(state, strict=False)
+        print(f"  Loaded {len(state)} weight tensors.")
+    else:
+        print(f"  WARNING: --qwen_ckpt not provided or not found, using vanilla model!")
+
+    model.eval()
+    return model, processor
+
+
 def load_enhanced_model(args):
-    """加载带 ClusterPredictor + SAE 的增强模型。"""
+    """带 ClusterPredictor + SAE + SemanticCompleter + PCS 的增强模型。"""
     from src.Model import QwenWithClusterPredictorAndSAE
 
     print("Loading enhanced model (ClusterPredictor + SAE)...")
@@ -133,38 +138,59 @@ def load_enhanced_model(args):
         device=CFG.device,
     )
     if args.qwen_ckpt and os.path.exists(args.qwen_ckpt):
-            state = torch.load(args.qwen_ckpt, map_location="cpu")
-            # 1. 必须让最外层 model 加载，这样 semantic_cross_attn 和 lambda 才能被正确赋值
-            model.load_state_dict(state, strict=False) 
-            print("  Enhanced model weights (Stage 2) loaded.")
-    
-    # 2. 放到 GPU 上
+        state = torch.load(args.qwen_ckpt, map_location="cpu")
+        model.load_state_dict(state, strict=False)
+        print("  Enhanced model weights (Stage 2) loaded.")
+
     model.to(CFG.device)
-    
-    # 3. 极其重要：开启评估模式，关闭 Dropout！
-    model.eval() 
-    
+    model.eval()
+    return model
+
+
+def load_enhanced_model_no_pcs(args):
+    """消融版增强模型：无 PCA suppression，其余与完整版一致。"""
+    from ablation.Model_no_pcs import QwenWithClusterPredictorAndSAE
+
+    print("Loading enhanced model (NO PCS ablation)...")
+    cluster_path = os.path.join(CFG.label_dir, f"feature_clusters_layer{args.layer}.json")
+    model = QwenWithClusterPredictorAndSAE.from_pretrained(
+        model_id=CFG.model_id,
+        sae_ckpt_dir=CFG.save_dir,
+        cluster_path=cluster_path,
+        inject_layer=args.layer,
+        latent_mult=CFG.latent_mult,
+        topk=CFG.topk,
+        top_n_patches=CFG.top_n_patches,
+        predictor_ckpt=args.no_pcs_predictor_ckpt,
+        device=CFG.device,
+    )
+    if args.no_pcs_qwen_ckpt and os.path.exists(args.no_pcs_qwen_ckpt):
+        state = torch.load(args.no_pcs_qwen_ckpt, map_location="cpu")
+        model.load_state_dict(state, strict=False)
+        print("  No-PCS model weights loaded.")
+
+    model.to(CFG.device)
+    model.eval()
     return model
 
 
 # ── 评估循环 ──────────────────────────────────────────────────────────────────
 
-def evaluate_base(base_model, processor, dataset, save_path=None):
-    """用原始 Qwen2.5-VL 评估（纯 baseline）。"""
+def evaluate_base(base_model, processor, dataset, save_path=None, label="base"):
+    """用原始或 finetune 过的 Qwen2.5-VL 评估（无 hook）。"""
     from qwen_vl_utils import process_vision_info
 
     print(f"\n{'='*60}")
-    print(f"Evaluating: base (vanilla Qwen2.5-VL)")
+    print(f"Evaluating: {label}")
     print(f"{'='*60}")
 
     results = []
-    for item in tqdm(dataset, desc="base eval"):
+    for item in tqdm(dataset, desc=f"{label} eval"):
         image = item["image"]
         prompt = item["prompt"]
         answer = item["answer"]
         choices = item["choices"]
 
-        # 构造带 instruction 的 prompt
         prompt_text = build_prompt(prompt, choices)
 
         tmp_path = "/tmp/cvbench_tmp.png"
@@ -242,7 +268,6 @@ def evaluate_enhanced(model, dataset, save_path=None):
         answer = item["answer"]
         choices = item["choices"]
 
-        # enhanced 也用同样的 prompt 构造，保证公平对比
         prompt_text = build_prompt(prompt, choices)
 
         tmp_path = "/tmp/cvbench_tmp.png"
@@ -299,7 +324,6 @@ def compute_metrics(results, label=""):
             return 0.0
         return sum(1 for i in items if i["correct"]) / len(items) * 100
 
-    # 统计无法解析的 response
     n_unparsed = sum(1 for r in results if r.get("extracted") is None)
     n_total = len(results)
     if n_unparsed > 0:
@@ -349,27 +373,64 @@ def compute_metrics(results, label=""):
     }
 
 
-def print_comparison(base_m, enh_m):
+def print_comparison(metrics_dict):
+    """打印多个模型的对比表。metrics_dict: {label: metrics}"""
+    labels = list(metrics_dict.keys())
+    if len(labels) < 2:
+        return
+
     print(f"\n{'='*70}")
-    print(f"  CV-Bench Comparison: Base vs Enhanced")
+    print(f"  CV-Bench Comparison")
     print(f"{'='*70}")
-    print(f"  {'Metric':<25s} {'Base':>8s} {'Enhanced':>10s} {'Delta':>8s}")
-    print(f"  {'─'*55}")
-    for name, key in [("CV-Bench Overall","cv_bench"), ("2D Accuracy","acc_2d"),
-                       ("  ADE20K","acc_ade"), ("  COCO","acc_coco"),
-                       ("3D Accuracy","acc_3d"), ("  Omni3D","acc_omni")]:
-        b, e = base_m[key], enh_m[key]
-        d = e - b
-        print(f"  {name:<25s} {b:8.2f} {e:10.2f} {'+'if d>0 else ''}{d:8.2f}")
-    all_tasks = sorted(set(list(base_m["per_task"]) + list(enh_m["per_task"])))
-    print(f"  {'─'*55}")
+
+    # Header
+    header = f"  {'Metric':<25s}"
+    for label in labels:
+        header += f" {label:>12s}"
+    if len(labels) >= 2:
+        header += f" {'Delta':>8s}"
+    print(header)
+    print(f"  {'─'*60}")
+
+    # Rows
+    rows = [
+        ("CV-Bench Overall", "cv_bench"),
+        ("2D Accuracy", "acc_2d"),
+        ("  ADE20K", "acc_ade"),
+        ("  COCO", "acc_coco"),
+        ("3D Accuracy", "acc_3d"),
+        ("  Omni3D", "acc_omni"),
+    ]
+    for name, key in rows:
+        line = f"  {name:<25s}"
+        vals = [metrics_dict[l][key] for l in labels]
+        for v in vals:
+            line += f" {v:12.2f}"
+        if len(vals) >= 2:
+            d = vals[-1] - vals[0]
+            line += f" {'+'if d>0 else ''}{d:7.2f}"
+        print(line)
+
+    # Per-task
+    all_tasks = sorted(set(
+        t for m in metrics_dict.values() for t in m["per_task"]
+    ))
+    print(f"  {'─'*60}")
     for t in all_tasks:
-        b = base_m["per_task"].get(t, 0)
-        e = enh_m["per_task"].get(t, 0)
-        d = e - b
-        print(f"    {t:<23s} {b:8.2f} {e:10.2f} {'+'if d>0 else ''}{d:8.2f}")
-    print(f"  {'─'*55}")
-    print(f"  {'Unparsed':<25s} {base_m['n_unparsed']:>8d} {enh_m['n_unparsed']:>10d}")
+        line = f"    {t:<23s}"
+        vals = [metrics_dict[l]["per_task"].get(t, 0) for l in labels]
+        for v in vals:
+            line += f" {v:12.2f}"
+        if len(vals) >= 2:
+            d = vals[-1] - vals[0]
+            line += f" {'+'if d>0 else ''}{d:7.2f}"
+        print(line)
+
+    print(f"  {'─'*60}")
+    line = f"  {'Unparsed':<25s}"
+    for l in labels:
+        line += f" {metrics_dict[l]['n_unparsed']:>12d}"
+    print(line)
     print(f"{'='*70}")
 
 
@@ -377,11 +438,20 @@ def print_comparison(base_m, enh_m):
 
 def main():
     parser = argparse.ArgumentParser()
-    parser.add_argument("--mode", type=str, default="both", choices=["base","enhanced","both"])
+    parser.add_argument("--mode", type=str, default="both",
+                        choices=["base", "enhanced", "no_pcs", "finetune_baseline", "both", "all"])
     parser.add_argument("--layer", type=int, default=CFG.vis_layer)
     parser.add_argument("--predictor_ckpt", type=str, default="outputs/focus_ckpt/predictor_best.pt")
-    parser.add_argument("--qwen_ckpt", type=str, default=None)
-    parser.add_argument("--subset", type=str, default=None, choices=["2D","3D"])
+    parser.add_argument("--qwen_ckpt", type=str, default=None,
+                        help="For enhanced: Stage 2 weights. For finetune_baseline: ablation weights.")
+    parser.add_argument("--baseline_ckpt", type=str, default=None,
+                        help="Finetune baseline weights (used in --mode all)")
+    parser.add_argument("--no_pcs_predictor_ckpt", type=str,
+                        default="outputs/ablation_no_pcs/predictor_best.pt",
+                        help="No-PCS ablation predictor weights")
+    parser.add_argument("--no_pcs_qwen_ckpt", type=str, default=None,
+                        help="No-PCS ablation LM weights")
+    parser.add_argument("--subset", type=str, default=None, choices=["2D", "3D"])
     parser.add_argument("--save_dir", type=str, default="outputs/cvbench_results")
     parser.add_argument("--max_samples", type=int, default=None)
     args = parser.parse_args()
@@ -405,37 +475,68 @@ def main():
         print(f"    {t}: {c}")
 
     # ── 评估 ──
-    base_m = enh_m = None
+    all_metrics = {}
 
-    if args.mode in ["base", "both"]:
+    run_base     = args.mode in ["base", "both", "all"]
+    run_ft_base  = args.mode in ["finetune_baseline", "all"]
+    run_no_pcs   = args.mode in ["no_pcs", "all"]
+    run_enhanced = args.mode in ["enhanced", "both", "all"]
+
+    # 1. Base (vanilla Qwen)
+    if run_base:
         base_model, processor = load_base_model()
         res = evaluate_base(
             base_model, processor, ds,
             save_path=os.path.join(args.save_dir, "base_results.json"),
+            label="base (vanilla)",
         )
-        base_m = compute_metrics(res, label="Base Qwen2.5-VL")
-        # 释放显存，给 enhanced 模型腾空间
-        if args.mode == "both":
-            del base_model, processor
-            torch.cuda.empty_cache()
+        all_metrics["base"] = compute_metrics(res, label="Base Qwen2.5-VL")
+        del base_model, processor
+        torch.cuda.empty_cache()
 
-    if args.mode in ["enhanced", "both"]:
+    # 2. Finetune baseline (same data, no hooks)
+    if run_ft_base:
+        ft_ckpt = args.baseline_ckpt or args.qwen_ckpt
+        ft_model, ft_processor = load_finetune_baseline(ft_ckpt)
+        res = evaluate_base(
+            ft_model, ft_processor, ds,
+            save_path=os.path.join(args.save_dir, "finetune_baseline_results.json"),
+            label="finetune_baseline",
+        )
+        all_metrics["finetune_baseline"] = compute_metrics(res, label="Finetune Baseline (no hooks)")
+        del ft_model, ft_processor
+        torch.cuda.empty_cache()
+
+    # 3. No-PCS ablation (full architecture minus PCA suppression)
+    if run_no_pcs:
+        no_pcs_model = load_enhanced_model_no_pcs(args)
+        res = evaluate_enhanced(
+            no_pcs_model, ds,
+            save_path=os.path.join(args.save_dir, "no_pcs_results.json"),
+        )
+        all_metrics["no_pcs"] = compute_metrics(res, label="Enhanced (no PCS)")
+        del no_pcs_model
+        torch.cuda.empty_cache()
+
+    # 4. Enhanced (full architecture)
+    if run_enhanced:
         enhanced_model = load_enhanced_model(args)
         res = evaluate_enhanced(
             enhanced_model, ds,
             save_path=os.path.join(args.save_dir, "enhanced_results.json"),
         )
-        enh_m = compute_metrics(res, label="Enhanced")
+        all_metrics["enhanced"] = compute_metrics(res, label="Enhanced")
+        del enhanced_model
+        torch.cuda.empty_cache()
 
-    if base_m and enh_m:
-        print_comparison(base_m, enh_m)
+    # ── 对比 ──
+    if len(all_metrics) >= 2:
+        print_comparison(all_metrics)
 
-    summary = {}
-    if base_m: summary["base"] = base_m
-    if enh_m:  summary["enhanced"] = enh_m
+    # ── 保存 ──
     with open(os.path.join(args.save_dir, "summary.json"), "w") as f:
-        json.dump(summary, f, indent=2)
-    print(f"\nDone.")
+        json.dump(all_metrics, f, indent=2)
+    print(f"\nDone. Summary saved to {args.save_dir}/summary.json")
 
 
 if __name__ == "__main__":

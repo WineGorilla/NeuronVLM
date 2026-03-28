@@ -6,6 +6,7 @@
 /results/
 /checkpoints/
 /logs/
+/newoutputs/
 
 # python
 *.pyc
