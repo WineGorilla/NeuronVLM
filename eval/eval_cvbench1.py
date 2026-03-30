@@ -4,12 +4,11 @@ CV-Bench 评估脚本。
 用法：
     python eval/eval_cvbench.py --mode base
     python eval/eval_cvbench.py --mode enhanced
-    python eval/eval_cvbench.py --mode spatial
     python eval/eval_cvbench.py --mode finetune_baseline --qwen_ckpt outputs/ablation_baseline/qwen_best.pt
-    python eval/eval_cvbench.py --mode no_pcs --no_pcs_qwen_ckpt outputs/ablation_no_pcs/qwen_best.pt
     python eval/eval_cvbench.py --mode both
     python eval/eval_cvbench.py --mode all --qwen_ckpt outputs/ablation_baseline/qwen_best.pt
     python eval/eval_cvbench.py --mode both --max_samples 50
+    python eval/eval_cvbench.py --mode no_pcs --no_pcs_qwen_ckpt outputs/ablation_no_pcs/qwen_best.pt
 """
 import os
 import sys
@@ -48,13 +47,13 @@ def extract_choice_letter(response: str) -> str | None:
     text = response.strip().split("\n")[0].strip().upper()
     if not text:
         return None
-    m = re.search(r'\(([A-Z])\)', text)
+    m = re.search(r'\(([A-D])\)', text)
     if m:
         return f"({m.group(1)})"
-    m = re.search(r'(?:ANSWER|OPTION)\s*(?:IS|:)?\s*\(?([A-Z])\)?', text)
+    m = re.search(r'(?:ANSWER|OPTION)\s*(?:IS|:)?\s*\(?([A-D])\)?', text)
     if m:
         return f"({m.group(1)})"
-    m = re.match(r'^([A-Z])(?:[\s.,):]|$)', text)
+    m = re.match(r'^([A-D])(?:[\s.,):]|$)', text)
     if m:
         return f"({m.group(1)})"
     return None
@@ -96,7 +95,9 @@ def load_base_model():
 
 
 def load_finetune_baseline(qwen_ckpt):
-    """原始 Qwen2.5-VL + finetune 过的 top-8 层权重，无 hook / 额外模块。"""
+    """原始 Qwen2.5-VL + finetune 过的 top-8 层权重，无 hook / 额外模块。
+    用于 ablation：验证提升来自架构还是数据。
+    """
     from transformers import Qwen2_5_VLForConditionalGeneration, AutoProcessor
 
     print("Loading finetune baseline (Qwen + finetuned layers, no hooks)...")
@@ -120,7 +121,7 @@ def load_finetune_baseline(qwen_ckpt):
 
 
 def load_enhanced_model(args):
-    """带 ClusterPredictor + SAE + SemanticCompleter + PCS 的增强模型（无 spatial）。"""
+    """带 ClusterPredictor + SAE + SemanticCompleter + PCS 的增强模型。"""
     from src.Model import QwenWithClusterPredictorAndSAE
 
     print("Loading enhanced model (ClusterPredictor + SAE)...")
@@ -146,35 +147,8 @@ def load_enhanced_model(args):
     return model
 
 
-def load_spatial_model(args):
-    """带 SpatialPatchInteraction 的 v2 增强模型。"""
-    from src.Model_v2 import QwenWithClusterPredictorAndSAE
-
-    print("Loading spatial model (Model_v2: enhanced + SpatialPatchInteraction)...")
-    cluster_path = os.path.join(CFG.label_dir, f"feature_clusters_layer{args.layer}.json")
-    model = QwenWithClusterPredictorAndSAE.from_pretrained(
-        model_id=CFG.model_id,
-        sae_ckpt_dir=CFG.save_dir,
-        cluster_path=cluster_path,
-        inject_layer=args.layer,
-        latent_mult=CFG.latent_mult,
-        topk=CFG.topk,
-        top_n_patches=CFG.top_n_patches,
-        predictor_ckpt=args.spatial_predictor_ckpt,
-        device=CFG.device,
-    )
-    if args.spatial_qwen_ckpt and os.path.exists(args.spatial_qwen_ckpt):
-        state = torch.load(args.spatial_qwen_ckpt, map_location="cpu")
-        model.load_state_dict(state, strict=False)
-        print("  Spatial model weights (Stage 2) loaded.")
-
-    model.to(CFG.device)
-    model.eval()
-    return model
-
-
 def load_enhanced_model_no_pcs(args):
-    """消融版增强模型：无 PCA suppression。"""
+    """消融版增强模型：无 PCA suppression，其余与完整版一致。"""
     from ablation.Model_no_pcs import QwenWithClusterPredictorAndSAE
 
     print("Loading enhanced model (NO PCS ablation)...")
@@ -281,14 +255,14 @@ def evaluate_base(base_model, processor, dataset, save_path=None, label="base"):
     return results
 
 
-def evaluate_enhanced(model, dataset, save_path=None, label="enhanced"):
-    """用增强模型评估（enhanced 或 spatial 均可）。"""
+def evaluate_enhanced(model, dataset, save_path=None):
+    """用增强模型（ClusterPredictor + SAE）评估。"""
     print(f"\n{'='*60}")
-    print(f"Evaluating: {label}")
+    print(f"Evaluating: enhanced (ClusterPredictor + SAE)")
     print(f"{'='*60}")
 
     results = []
-    for item in tqdm(dataset, desc=f"{label} eval"):
+    for item in tqdm(dataset, desc="enhanced eval"):
         image = item["image"]
         prompt = item["prompt"]
         answer = item["answer"]
@@ -400,7 +374,7 @@ def compute_metrics(results, label=""):
 
 
 def print_comparison(metrics_dict):
-    """打印多个模型的对比表。"""
+    """打印多个模型的对比表。metrics_dict: {label: metrics}"""
     labels = list(metrics_dict.keys())
     if len(labels) < 2:
         return
@@ -409,6 +383,7 @@ def print_comparison(metrics_dict):
     print(f"  CV-Bench Comparison")
     print(f"{'='*70}")
 
+    # Header
     header = f"  {'Metric':<25s}"
     for label in labels:
         header += f" {label:>12s}"
@@ -417,6 +392,7 @@ def print_comparison(metrics_dict):
     print(header)
     print(f"  {'─'*60}")
 
+    # Rows
     rows = [
         ("CV-Bench Overall", "cv_bench"),
         ("2D Accuracy", "acc_2d"),
@@ -435,6 +411,7 @@ def print_comparison(metrics_dict):
             line += f" {'+'if d>0 else ''}{d:7.2f}"
         print(line)
 
+    # Per-task
     all_tasks = sorted(set(
         t for m in metrics_dict.values() for t in m["per_task"]
     ))
@@ -462,21 +439,13 @@ def print_comparison(metrics_dict):
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--mode", type=str, default="both",
-                        choices=["base", "enhanced", "spatial", "no_pcs",
-                                 "finetune_baseline", "both", "all"])
+                        choices=["base", "enhanced", "no_pcs", "finetune_baseline", "both", "all"])
     parser.add_argument("--layer", type=int, default=CFG.vis_layer)
     parser.add_argument("--predictor_ckpt", type=str, default="outputs/focus_ckpt/predictor_best.pt")
     parser.add_argument("--qwen_ckpt", type=str, default=None,
                         help="For enhanced: Stage 2 weights. For finetune_baseline: ablation weights.")
     parser.add_argument("--baseline_ckpt", type=str, default=None,
                         help="Finetune baseline weights (used in --mode all)")
-    # ── spatial 专用参数 ──
-    parser.add_argument("--spatial_predictor_ckpt", type=str,
-                        default="outputs/focus_ckpt_spatial/predictor_best.pt",
-                        help="Spatial model (Model_v2) predictor weights")
-    parser.add_argument("--spatial_qwen_ckpt", type=str, default=None,
-                        help="Spatial model (Model_v2) LM weights")
-    # ── no_pcs 专用参数 ──
     parser.add_argument("--no_pcs_predictor_ckpt", type=str,
                         default="outputs/ablation_no_pcs/predictor_best.pt",
                         help="No-PCS ablation predictor weights")
@@ -512,7 +481,6 @@ def main():
     run_ft_base  = args.mode in ["finetune_baseline", "all"]
     run_no_pcs   = args.mode in ["no_pcs", "all"]
     run_enhanced = args.mode in ["enhanced", "both", "all"]
-    run_spatial  = args.mode in ["spatial", "all"]
 
     # 1. Base (vanilla Qwen)
     if run_base:
@@ -539,40 +507,26 @@ def main():
         del ft_model, ft_processor
         torch.cuda.empty_cache()
 
-    # 3. No-PCS ablation
+    # 3. No-PCS ablation (full architecture minus PCA suppression)
     if run_no_pcs:
         no_pcs_model = load_enhanced_model_no_pcs(args)
         res = evaluate_enhanced(
             no_pcs_model, ds,
             save_path=os.path.join(args.save_dir, "no_pcs_results.json"),
-            label="enhanced (no PCS)",
         )
         all_metrics["no_pcs"] = compute_metrics(res, label="Enhanced (no PCS)")
         del no_pcs_model
         torch.cuda.empty_cache()
 
-    # 4. Enhanced (v1: full architecture, no spatial)
+    # 4. Enhanced (full architecture)
     if run_enhanced:
         enhanced_model = load_enhanced_model(args)
         res = evaluate_enhanced(
             enhanced_model, ds,
             save_path=os.path.join(args.save_dir, "enhanced_results.json"),
-            label="enhanced (v1)",
         )
-        all_metrics["enhanced"] = compute_metrics(res, label="Enhanced (v1)")
+        all_metrics["enhanced"] = compute_metrics(res, label="Enhanced")
         del enhanced_model
-        torch.cuda.empty_cache()
-
-    # 5. Spatial (v2: full architecture + SpatialPatchInteraction)
-    if run_spatial:
-        spatial_model = load_spatial_model(args)
-        res = evaluate_enhanced(
-            spatial_model, ds,
-            save_path=os.path.join(args.save_dir, "spatial_results.json"),
-            label="spatial (v2)",
-        )
-        all_metrics["spatial"] = compute_metrics(res, label="Spatial (v2)")
-        del spatial_model
         torch.cuda.empty_cache()
 
     # ── 对比 ──
