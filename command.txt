@@ -70,7 +70,7 @@ python scripts/interpret.py --layer 8
 python scripts/cluster_features.py --layer 8 --n_clusters 32
 
 # 5. 构建训练数据
-python data/build_cluster_data.py --layer 8
+python scripts/build_cluster_data.py --layer 8
 
 # 
 # 阶段1：训练 ClusterPredictor（BCE loss）
@@ -112,3 +112,7 @@ python scripts/inference.py \
     --question "What color is the dog?" \
     --predictor_ckpt outputs/focus_ckpt/predictor_best.pt \
     --qwen_ckpt      outputs/focus_ckpt/qwen_best.pt
+
+
+# 调参专用
+python -m src.train_focus --stage 1 && python -m src.train_focus --stage 2 --resume best && python eval/eval_cvbench.py --mode enhanced

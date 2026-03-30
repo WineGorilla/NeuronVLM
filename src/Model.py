@@ -106,7 +106,8 @@ class SemanticCrossAttention(nn.Module):
         # Near-zero init: 初始注入量极小但梯度非零，避免 zero-init 死锁
         # std=0.001 × softplus(-3.0)≈0.049 → 初始扰动 < 0.00005，安全
         nn.init.normal_(self.out_proj.weight, std=0.001)
-        self.lambda_param = nn.Parameter(torch.tensor(3.0))
+        # 超参数 目前分数最高是2.0
+        self.lambda_param = nn.Parameter(torch.tensor(1.0))
 
     def forward(self, vision, extra):
         """

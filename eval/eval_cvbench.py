@@ -4,7 +4,7 @@ CV-Bench 评估脚本。
 用法：
     python eval/eval_cvbench.py --mode base
     python eval/eval_cvbench.py --mode enhanced
-    python eval/eval_cvbench.py --mode spatial
+    python eval/eval_cvbench.py --mode spatial --qwen_ckpt outputs/focus_v2_ckpt/qwen_best.pt
     python eval/eval_cvbench.py --mode finetune_baseline --qwen_ckpt outputs/ablation_baseline/qwen_best.pt
     python eval/eval_cvbench.py --mode no_pcs --no_pcs_qwen_ckpt outputs/ablation_no_pcs/qwen_best.pt
     python eval/eval_cvbench.py --mode both
