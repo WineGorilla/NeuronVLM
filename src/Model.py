@@ -107,7 +107,7 @@ class SemanticCrossAttention(nn.Module):
         # std=0.001 × softplus(-3.0)≈0.049 → 初始扰动 < 0.00005，安全
         nn.init.normal_(self.out_proj.weight, std=0.001)
         # 超参数 目前分数最高是0.75
-        self.lambda_param = nn.Parameter(torch.tensor(0.80))
+        self.lambda_param = nn.Parameter(torch.tensor(0.74))
 
     def forward(self, vision, extra):
         """
