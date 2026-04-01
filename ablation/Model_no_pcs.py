@@ -64,7 +64,7 @@ class SemanticCrossAttention(nn.Module):
         self.out_proj = nn.Linear(dim, dim, bias=False)
         self.norm     = nn.LayerNorm(dim)
         nn.init.normal_(self.out_proj.weight, std=0.001)
-        self.lambda_param = nn.Parameter(torch.tensor(3.0))
+        self.lambda_param = nn.Parameter(torch.tensor(0.75))
 
     def forward(self, vision, extra):
         lam = F.softplus(self.lambda_param)

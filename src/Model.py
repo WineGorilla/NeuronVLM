@@ -107,7 +107,7 @@ class SemanticCrossAttention(nn.Module):
         # std=0.001 × softplus(-3.0)≈0.049 → 初始扰动 < 0.00005，安全
         nn.init.normal_(self.out_proj.weight, std=0.001)
         # 超参数 目前分数最高是0.75
-        self.lambda_param = nn.Parameter(torch.tensor(0.74))
+        self.lambda_param = nn.Parameter(torch.tensor(0.75))
 
     def forward(self, vision, extra):
         """
@@ -728,8 +728,9 @@ class QwenWithClusterPredictorAndSAE(nn.Module):
         return self.base_model(**kwargs)
 
     @classmethod
+    #目前最优抑制成分个数为3
     def from_pretrained(cls, model_id, sae_ckpt_dir, cluster_path,
-                        inject_layer=8, suppress_layer=-8, n_suppress_pcs=3,
+                        inject_layer=8, suppress_layer=-8, n_suppress_pcs=1,
                         latent_mult=8, topk=32, top_n_patches=60,
                         top_k_clusters=10, cluster_threshold=0.5,
                         bce_lambda=0.5, align_lambda=0.3,

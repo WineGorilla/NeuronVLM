@@ -5,13 +5,13 @@ Stage 1: 学 what to focus
   - 训练 ClusterPredictor + ImageClusterScorer
   - Hook 只读：预测 cluster，不修改 hidden
   - Loss = BCE + alignment
-  - 命令: python -m src.train_focus_v2 --stage 1
+  - 命令: python -m src.train_focus_copy --stage 1
 
 Stage 2: 学 how to inject
-  - 训练 SemanticCrossAttention + SpatialPatchInteraction + ExtraProjector + top LM layers
-  - Hook 读写：预测 cluster + 注入 extra tokens + patch 间空间交互
+  - 训练 SemanticCrossAttention + ExtraProjector + top LM layers
+  - Hook 读写：预测 cluster + 注入 extra tokens
   - Loss = LM + BCE + alignment
-  - 命令: python -m src.train_focus_v2 --stage 2 --resume best
+  - 命令: python -m src.train_focus_copy --stage 2 --resume best
 """
 import os
 import sys
@@ -24,20 +24,20 @@ import torch
 import torch.nn.functional as F
 
 from config import CFG
-from src.Model_v2 import QwenWithClusterPredictorAndSAE
+from src.Model_copy import QwenWithClusterPredictorAndSAE
 from src.dataset import VisionTextDataset
 
 
 # ── 超参数 ────────────────────────────────────────────────────────────────────
 
 LR_STAGE1      = 1e-4   # predictor + scorer
-LR_STAGE2_MAIN = 1e-5   # LM layers + cross-attn + spatial + projector
+LR_STAGE2_MAIN = 1e-5   # LM layers + cross-attn + projector
 LR_STAGE2_AUX  = 1e-5   # predictor + scorer（小 lr 微调或冻结）
 EPOCHS         = 3
 GRAD_ACCUM     = 8
 LOG_EVERY      = 10
 SAVE_EVERY     = 500
-SAVE_DIR       = "outputs/focus_v2_ckpt"
+SAVE_DIR       = "outputs/focus_ckpt_copy"
 
 
 def main():
@@ -88,8 +88,6 @@ def main():
             p.requires_grad = False
         for p in model.semantic_cross_attn.parameters():
             p.requires_grad = False
-        for p in model.spatial_interaction.parameters():
-            p.requires_grad = False
 
         # 只训 predictor + scorer
         for p in model.cluster_predictor.parameters():
@@ -106,7 +104,7 @@ def main():
 
     else:
         print("=" * 60)
-        print("Stage 2: Learn how to inject (CrossAttention + Spatial + LM layers)")
+        print("Stage 2: Learn how to inject (CrossAttention + LM layers)")
         print("=" * 60)
 
         if not args.resume:
@@ -130,8 +128,6 @@ def main():
             p.requires_grad = True
         for p in model.semantic_cross_attn.parameters():
             p.requires_grad = True
-        for p in model.spatial_interaction.parameters():       # ← 新增
-            p.requires_grad = True
         for p in model.pc_suppressor.parameters():
             p.requires_grad = True
         for p in model.semantic_completer.parameters():
@@ -154,7 +150,6 @@ def main():
             [p for p in model.base_model.parameters() if p.requires_grad]
             + list(model.extra_projector.parameters())
             + list(model.semantic_cross_attn.parameters())
-            + list(model.spatial_interaction.parameters())     # ← 新增
             + list(model.pc_suppressor.parameters())
             + list(model.semantic_completer.parameters())
         )
@@ -242,10 +237,8 @@ def main():
                               f"total={total_loss.item():.4f}")
                     else:
                         lam = F.softplus(model.semantic_cross_attn.lambda_param).item()
-                        gam = F.softplus(model.spatial_interaction.gamma_param).item()
                         print(f"  step {step:5d} | total={total_loss.item():.4f} "
-                              f"lm={metric_a:.4f} bce={metric_b:.4f} "
-                              f"λ={lam:.4f} γ={gam:.4f}")
+                              f"lm={metric_a:.4f} bce={metric_b:.4f} λ={lam:.4f}")
 
                 # ── NaN/Inf 检查 ─────────────────────────────────────────────
                 if torch.isnan(total_loss) or torch.isinf(total_loss):

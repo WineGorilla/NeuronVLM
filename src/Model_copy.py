@@ -1,35 +1,35 @@
 """
 QwenWithClusterPredictorAndSAE — Single-Forward, Sparse Local Injection
-+ Spatial Patch Interaction (v2)
 
-新增模块 — SpatialPatchInteraction：
-  在 SemanticCrossAttention 之后、写回 hidden state 之前，
-  让被激活的 patches 之间做一次带 2D 位置编码的 self-attention。
+核心思想：
+  所有语义决策和注入都发生在 transformer 的中间层（inject_layer）的 post-hook 内。
+  一次 forward，一个 hidden state，一个 truth。
 
-  为什么需要：
-    SemanticCrossAttention 是 patch-wise 独立的（每个 patch 只和自己的 SAE 重构交互），
-    无法捕捉 patch 间的空间关系。但计数、空间推理（"左边"、"之间"、"更大"）
-    本质上需要 patch 之间的信息交换。
+注入策略 — Sparse Local Cross-Attention：
+  不再把所有 cluster 信息 pool 成全局 extra tokens 广播给所有 vision patches。
+  而是：找到每个 cluster 激活的 top-k patches，只让这些 patches 和自己的 SAE 重构
+  做 cross-attention。未激活的 patches 完全不动。
 
-  设计：
-    1. 2D Sinusoidal PE：根据 vision grid 的 (row, col) 生成位置编码，
-       让 attention 知道 patch 的绝对位置和相对距离。
-    2. Multi-head self-attention (2-4 heads)：轻量但足够捕捉空间模式。
-    3. Zero-init output：初始等价于恒等，训练初期不干扰。
-    4. 只在 activated patches 上运行：稀疏，计算量小。
+  vision[active] = CrossAttn(Q=vision[active], K=recon[active], V=recon[active])
+  vision[inactive] = vision[inactive]  # untouched
 
-  流程变化：
-    原：vision[active] = CrossAttn(vision[active], recon[active])
-    新：vision[active] = CrossAttn(vision[active], recon[active])
-        vision[active] = SpatialInteract(vision[active], pos_2d[active])
+推理流程（单次 forward）：
+  1. 图片+问题 → Qwen forward 开始
+  2. Layer 0..N-1 正常执行
+  3. Layer N (inject_layer) 执行完毕 → post-hook 触发：
+     a. ClusterPredictor: text hidden → 预测哪些语义 cluster 被激活
+     b. SAE encode vision patches → 按 cluster 筛选 top-k activated patches
+     c. SAE decode → 每个 patch 的纯净语义重构
+     d. Sparse local cross-attention: 只修改激活的 patches
+  4. Layer N+1..末尾 使用修改后的 hidden 继续
+  5. generate() 输出
 
-训练注意：
-  SpatialPatchInteraction 的参数在 Stage 2 一起训练，
-  Stage 1 不涉及（因为 Stage 1 不修改 hidden state）。
+训练流程：
+  Stage 1: hook 只读 — 预测 cluster，计算 BCE + alignment loss，不修改 hidden
+  Stage 2: hook 读写 — 预测 cluster + 稀疏注入，联合 LM + BCE + alignment loss
 """
 import os
 import json
-import math
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -40,7 +40,11 @@ from src.SAE import SAE
 # ── 子模块 ────────────────────────────────────────────────────────────────────
 
 class ClusterPredictor(nn.Module):
-    """Text hidden → cluster logits"""
+    """Text hidden → cluster logits
+
+    使用最后一个 text token 的 hidden state（Causal LM 中聚合了全部上文语义），
+    而非 mean pooling（会掺杂缺乏上下文的早期 token，导致语义稀释）。
+    """
     def __init__(self, dim: int, n_clusters: int):
         super().__init__()
         self.head = nn.Sequential(
@@ -50,6 +54,7 @@ class ClusterPredictor(nn.Module):
         )
 
     def forward(self, h, text_pos):
+        # 取出所有的 text tokens 并求均值，作为整体的语义特征
         text_h_all = h[:, text_pos, :]
         mean_text_h = text_h_all.mean(dim=1).float()
         return self.head(mean_text_h)
@@ -82,7 +87,14 @@ class ExtraProjector(nn.Module):
 
 
 class SemanticCrossAttention(nn.Module):
-    """Sparse local cross-attention: 只更新被选中的 vision patches"""
+    """Sparse local cross-attention: 只更新被选中的 vision patches
+
+    Q = selected vision patches (from hidden state)
+    K, V = their SAE reconstructed semantic features (projected)
+
+    Zero-Init 策略：out_proj 权重初始化为 0，lambda 初始化为极小值，
+    确保训练初期注入量严格为 0，模型等价于原始预训练模型。
+    """
     def __init__(self, dim: int):
         super().__init__()
         self.dim = dim
@@ -91,10 +103,20 @@ class SemanticCrossAttention(nn.Module):
         self.v_proj   = nn.Linear(dim, dim, bias=False)
         self.out_proj = nn.Linear(dim, dim, bias=False)
         self.norm     = nn.LayerNorm(dim)
+        # Near-zero init: 初始注入量极小但梯度非零，避免 zero-init 死锁
+        # std=0.001 × softplus(-3.0)≈0.049 → 初始扰动 < 0.00005，安全
         nn.init.normal_(self.out_proj.weight, std=0.001)
-        self.lambda_param = nn.Parameter(torch.tensor(3.0))
+        # 超参数 目前分数最高是0.75
+        self.lambda_param = nn.Parameter(torch.tensor(0.75))
 
     def forward(self, vision, extra):
+        """
+        Args:
+            vision: (N, dim) — selected vision patch hidden states
+            extra:  (N, dim) — corresponding SAE reconstructed features (projected)
+        Returns:
+            (N, dim) — updated vision patches
+        """
         lam = F.softplus(self.lambda_param)
         Q = self.q_proj(vision)
         K = self.k_proj(extra)
@@ -103,195 +125,111 @@ class SemanticCrossAttention(nn.Module):
         return vision + lam * self.norm(self.out_proj(attn @ V))
 
 
-class SpatialPatchInteraction(nn.Module):
-    """带 2D 位置编码的稀疏 patch 间 self-attention，用于空间推理。
-
-    核心思想：
-      activated patches 之间需要知道彼此的空间位置才能推理
-      "A 在 B 左边"、"有 3 个红色物体"等空间/计数问题。
-
-    位置编码方案 — 2D Sinusoidal + Learnable Relative Bias：
-      1. 绝对位置：2D sinusoidal PE (row, col) → 拼接到 hidden 前做 QKV 投影
-         不增加 hidden dim，而是通过一个小的 pos_proj 混入 hidden。
-      2. 相对位置 bias：learnable log-spaced distance bias，
-         加到 attention logits 上，让模型直接学习"距离 d 的 patch 对
-         应该有多大的 attention"。
-
-    Multi-head 设计：
-      n_heads=4，head_dim = dim // 4（或更小的 bottleneck）。
-      为了控制参数量，QKV 投影用 bottleneck dim 而非 full dim。
-
-    Zero-init：
-      out_proj 初始化为近零 + gamma 初始化极小，训练初期 ≈ identity。
-    """
-    def __init__(self, dim: int, n_heads: int = 4, max_grid: int = 40,
-                 n_dist_bins: int = 32):
-        super().__init__()
-        self.dim = dim
-        self.n_heads = n_heads
-        self.head_dim = dim // n_heads
-        self.max_grid = max_grid
-        self.n_dist_bins = n_dist_bins
-
-        # 位置编码混入：2D pos → dim
-        # sinusoidal PE 维度 = dim // 2 each for row/col, 拼接 = dim
-        self.pos_proj = nn.Linear(dim, dim, bias=False)
-        nn.init.normal_(self.pos_proj.weight, std=0.01)
-
-        # QKV 投影（full dim → full dim, multi-head）
-        self.q_proj = nn.Linear(dim, dim, bias=False)
-        self.k_proj = nn.Linear(dim, dim, bias=False)
-        self.v_proj = nn.Linear(dim, dim, bias=False)
-        self.out_proj = nn.Linear(dim, dim, bias=False)
-        nn.init.normal_(self.out_proj.weight, std=0.001)
-
-        # Learnable relative distance bias (per head)
-        # 把连续的 2D 距离离散化到 n_dist_bins 个 bin
-        self.dist_bias = nn.Parameter(torch.zeros(n_heads, n_dist_bins))
-
-        # 输出 gate，初始极小
-        self.gamma_param = nn.Parameter(torch.tensor(-3.0))
-
-        self.norm = nn.LayerNorm(dim)
-
-    def _sinusoidal_pe_2d(self, rows, cols, dim, device):
-        """生成 2D sinusoidal positional encoding。
-
-        Args:
-            rows: (N,) 每个 patch 的行号
-            cols: (N,) 每个 patch 的列号
-            dim:  总维度（row 用 dim//2, col 用 dim//2）
-
-        Returns:
-            (N, dim) positional encoding
-        """
-        half_dim = dim // 2
-        freq = torch.exp(
-            torch.arange(0, half_dim, 2, device=device, dtype=torch.float32)
-            * -(math.log(10000.0) / half_dim)
-        )  # (half_dim // 2,)
-
-        rows_f = rows.float().unsqueeze(-1)  # (N, 1)
-        cols_f = cols.float().unsqueeze(-1)
-
-        row_pe = torch.zeros(rows.shape[0], half_dim, device=device)
-        col_pe = torch.zeros(cols.shape[0], half_dim, device=device)
-
-        row_pe[:, 0::2] = torch.sin(rows_f * freq)
-        row_pe[:, 1::2] = torch.cos(rows_f * freq)
-        col_pe[:, 0::2] = torch.sin(cols_f * freq)
-        col_pe[:, 1::2] = torch.cos(cols_f * freq)
-
-        return torch.cat([row_pe, col_pe], dim=-1)  # (N, dim)
-
-    def _distance_to_bin(self, dist_matrix):
-        """将连续 L2 距离映射到离散 bin index。
-
-        使用 log-spaced binning：近距离分辨率高，远距离分辨率低。
-        bin_0 = dist < 1, bin_1 = dist < 2, ..., log-spaced after that.
-
-        Args:
-            dist_matrix: (N, N) 非负距离矩阵
-
-        Returns:
-            (N, N) LongTensor, 每个元素是 bin index ∈ [0, n_dist_bins-1]
-        """
-        # log(1 + dist) 然后线性映射到 [0, n_bins-1]
-        log_dist = torch.log1p(dist_matrix)
-        max_log_dist = math.log1p(self.max_grid * math.sqrt(2))  # 对角线最大距离
-        bins = (log_dist / max_log_dist * (self.n_dist_bins - 1)).long()
-        return bins.clamp(0, self.n_dist_bins - 1)
-
-    def forward(self, vision_h, patch_rows, patch_cols):
-        """
-        Args:
-            vision_h:   (N, dim)  — activated patches 的 hidden states (float)
-            patch_rows: (N,) LongTensor — 每个 patch 在 vision grid 中的行号
-            patch_cols: (N,) LongTensor — 列号
-
-        Returns:
-            (N, dim) — 空间交互后的 hidden states
-        """
-        N, D = vision_h.shape
-        gamma = F.softplus(self.gamma_param)
-
-        if N <= 1:
-            return vision_h  # 只有 1 个 patch，无法交互
-
-        # ── 2D Positional Encoding ────────────────────────────────────────────
-        pe = self._sinusoidal_pe_2d(patch_rows, patch_cols, D, vision_h.device)
-        h_with_pos = vision_h + self.pos_proj(pe)  # (N, D)
-
-        # ── Multi-head Self-Attention ─────────────────────────────────────────
-        Q = self.q_proj(h_with_pos).view(N, self.n_heads, self.head_dim).transpose(0, 1)  # (H, N, d)
-        K = self.k_proj(h_with_pos).view(N, self.n_heads, self.head_dim).transpose(0, 1)
-        V = self.v_proj(vision_h).view(N, self.n_heads, self.head_dim).transpose(0, 1)
-        # 注意：V 不加位置编码，保持内容纯净；位置信息只影响 "谁关注谁"
-
-        attn_logits = torch.matmul(Q, K.transpose(-1, -2)) / math.sqrt(self.head_dim)  # (H, N, N)
-
-        # ── Relative Distance Bias ────────────────────────────────────────────
-        # 计算 2D 欧氏距离
-        row_diff = patch_rows.float().unsqueeze(1) - patch_rows.float().unsqueeze(0)  # (N, N)
-        col_diff = patch_cols.float().unsqueeze(1) - patch_cols.float().unsqueeze(0)
-        dist_matrix = torch.sqrt(row_diff ** 2 + col_diff ** 2)  # (N, N)
-
-        bin_indices = self._distance_to_bin(dist_matrix)  # (N, N) LongTensor
-        # 每个 head 有自己的 distance bias
-        rel_bias = self.dist_bias[:, bin_indices]  # (H, N, N)
-
-        attn_logits = attn_logits + rel_bias
-
-        attn_weights = F.softmax(attn_logits, dim=-1)  # (H, N, N)
-        attn_out = torch.matmul(attn_weights, V)  # (H, N, d)
-        attn_out = attn_out.transpose(0, 1).contiguous().view(N, D)  # (N, D)
-
-        return vision_h + gamma * self.norm(self.out_proj(attn_out))
-
-
 class PrincipalComponentSuppressor(nn.Module):
-    """在靠后层削弱 vision tokens 的主成分。"""
+    """在靠后层削弱 vision tokens 的主成分，迫使模型分散注意力。
+
+    原理：
+      vision patches 的 hidden states 通常被少数主成分主导（比如"大物体的轮廓"），
+      导致模型忽略空间关系、小物体计数等细节。削弱 top-k 主成分后，
+      次要特征（位置、相对距离、小物体）的信号占比上升。
+
+    实现：
+      1. 对 vision tokens 做 SVD
+      2. 投影到 top-k 主成分方向
+      3. 从原始 hidden 中减去 alpha * 主成分投影
+      alpha 可学习，初始化接近 0
+    """
     def __init__(self, n_suppress: int = 3):
         super().__init__()
         self.n_suppress = n_suppress
-        self.alpha_param = nn.Parameter(torch.tensor(-3.0))
+        # softplus(-3.0) ≈ 0.049，初始几乎不抑制
+        self.alpha_param = nn.Parameter(torch.tensor(-2.5))
 
     def forward(self, vision_h):
+        """
+        Args:
+            vision_h: (N, dim) vision patch hidden states (float)
+        Returns:
+            (N, dim) 主成分被削弱后的 vision hidden states
+        """
         alpha = F.softplus(self.alpha_param)
         N, D = vision_h.shape
+
         if N <= self.n_suppress:
             return vision_h
+
         mean = vision_h.mean(dim=0, keepdim=True)
         centered = vision_h - mean
+
         U, S, V = torch.svd_lowrank(centered, q=self.n_suppress)
-        proj = centered @ V @ V.T
+
+        # 主成分分量 = 投影到主成分空间再投影回来
+        proj = centered @ V @ V.T  # (N, D)
+
         return vision_h - alpha * proj
 
 
 class SemanticCompleter(nn.Module):
-    """根据问题语义，预测 SAE latent 空间中应该补充的缺失信息 Δz。"""
+    """根据问题语义，预测 SAE latent 空间中应该补充的缺失信息 Δz。
+
+    从 perception → reasoning 的跨越：
+      不只是从已有的 SAE latent 里挑选（重排），
+      而是根据问题推断"当前视觉表示缺了什么"，在 latent 空间补全。
+
+    设计（轻量 bottleneck 版）：
+      latent_dim 通常很大（7168），不能在 latent 空间做全连接。
+      改用 hidden_dim 空间的 bottleneck：
+      1. text_h (dim) → bottleneck (dim//4) → scale vector (dim)
+      2. z_cluster (k, latent_dim) 先通过 SAE decoder 映射到 hidden_dim 空间
+         → 在 hidden_dim 空间做 gating → 再通过 SAE encoder 映射回 latent 空间
+      但这样太复杂。更简单的方案：
+      直接在 latent 空间用 per-cluster-feature 的标量 gate：
+      1. text_h → 一个小向量 (n_clusters 维或 bottleneck 维)
+      2. 广播为 latent_dim 的 sparse mask（利用已有的 cluster_to_features 映射）
+
+    最终方案（极简高效）：
+      text_h (dim) → MLP → (n_clusters,) 维的 modulation weights
+      对每个 cluster，modulation weight 控制该 cluster 的 Δz 强度。
+      Δz 本身 = z_cluster 自己（self-reinforcement）* modulation。
+      这样参数量 = dim * n_clusters 级别，极小。
+    """
     def __init__(self, dim: int, latent_dim: int, n_clusters: int = None, bottleneck: int = 128):
         super().__init__()
         self.latent_dim = latent_dim
+        # text_h → bottleneck → latent_dim 的 delta 方向
+        # 用 bottleneck 避免 latent_dim × latent_dim 的大矩阵
         self.text_to_delta = nn.Sequential(
             nn.Linear(dim, bottleneck),
             nn.ReLU(),
             nn.Linear(bottleneck, bottleneck),
         )
+        # z_cluster 压缩到 bottleneck 空间做 gating
         self.z_to_gate = nn.Sequential(
             nn.Linear(latent_dim, bottleneck),
             nn.Sigmoid(),
         )
+        # bottleneck → latent_dim 的稀疏投影
         self.delta_proj = nn.Linear(bottleneck, latent_dim, bias=False)
         nn.init.normal_(self.delta_proj.weight, std=0.001)
+        # 可学习的整体强度
         self.beta_param = nn.Parameter(torch.tensor(-3.0))
 
     def forward(self, text_h, z_cluster):
+        """
+        Args:
+            text_h:    (dim,)          — 问题语义
+            z_cluster: (k, latent_dim) — patches 的 SAE 激活
+        Returns:
+            delta_z: (k, latent_dim) — 需要补充的 latent 修正
+        """
         beta = F.softplus(self.beta_param)
-        text_bn = self.text_to_delta(text_h)
-        gate = self.z_to_gate(z_cluster)
-        fused = gate * text_bn.unsqueeze(0)
-        delta_z = beta * self.delta_proj(fused)
+        # text → "需要什么" 的 bottleneck 表示
+        text_bn = self.text_to_delta(text_h)       # (bottleneck,)
+        # z_cluster → "有什么" 的 gate
+        gate = self.z_to_gate(z_cluster)            # (k, bottleneck)
+        # 交汇：gate * text_bn → 投影回 latent 空间
+        fused = gate * text_bn.unsqueeze(0)         # (k, bottleneck)
+        delta_z = beta * self.delta_proj(fused)     # (k, latent_dim)
         return delta_z
 
 
@@ -327,8 +265,7 @@ class QwenWithClusterPredictorAndSAE(nn.Module):
                  inject_layer=8, suppress_layer=-8, n_suppress_pcs=3,
                  top_n_patches=60, top_k_clusters=10,
                  cluster_threshold=0.5,
-                 bce_lambda=0.5, align_lambda=0.3, max_tokens=128,
-                 spatial_n_heads=4, spatial_n_dist_bins=32):
+                 bce_lambda=0.5, align_lambda=0.3, max_tokens=128):
         super().__init__()
         self.base_model  = base_model
         self.sae         = sae
@@ -351,16 +288,13 @@ class QwenWithClusterPredictorAndSAE(nn.Module):
         self.n_clusters = len(self.clusters)
 
         dim    = base_model.config.text_config.hidden_size
-        latent_dim = sae.latent_dim
+        latent_dim = sae.latent_dim  # SAE 的 latent 维度
         device = next(base_model.parameters()).device
 
         self.cluster_predictor    = ClusterPredictor(dim, self.n_clusters).to(device)
         self.image_cluster_scorer = ImageClusterScorer(dim, self.n_clusters).to(device)
         self.extra_projector      = ExtraProjector(dim).to(device)
         self.semantic_cross_attn  = SemanticCrossAttention(dim).to(device)
-        self.spatial_interaction  = SpatialPatchInteraction(
-            dim, n_heads=spatial_n_heads, n_dist_bins=spatial_n_dist_bins,
-        ).to(device)
         self.pc_suppressor        = PrincipalComponentSuppressor(n_suppress=n_suppress_pcs).to(device)
         self.semantic_completer   = SemanticCompleter(dim, latent_dim).to(device)
 
@@ -368,6 +302,7 @@ class QwenWithClusterPredictorAndSAE(nn.Module):
         n_layers = len(self._layers)
         print(f"  Found {n_layers} transformer layers")
 
+        # suppress_layer 支持负数索引（如 -8 表示倒数第 8 层）
         self.suppress_layer = suppress_layer if suppress_layer >= 0 else n_layers + suppress_layer
         print(f"  Inject @ layer {self.inject_layer}, Suppress @ layer {self.suppress_layer}")
 
@@ -382,7 +317,6 @@ class QwenWithClusterPredictorAndSAE(nn.Module):
         self._hook_fired: bool = False
         self._suppress_hook_fired: bool = False
         self._cached_positions: Optional[Tuple] = None
-        self._cached_grid_hw: Optional[Tuple[int, int]] = None  # (grid_h, grid_w) for spatial
         self._stashed_logits: Optional[torch.Tensor] = None
         self._stashed_h_vision: Optional[torch.Tensor] = None
         self._last_cluster_ids: List[int] = []
@@ -420,12 +354,7 @@ class QwenWithClusterPredictorAndSAE(nn.Module):
     def _get_token_positions(self, inputs):
         grid = inputs["image_grid_thw"]
         merge = self.base_model.config.vision_config.spatial_merge_size
-        grid_h = int(grid[0, 1].item() // merge)
-        grid_w = int(grid[0, 2].item() // merge)
-        n_img = grid_h * grid_w
-
-        # 缓存 grid 尺寸，供 spatial interaction 使用
-        self._cached_grid_hw = (grid_h, grid_w)
+        n_img = int(grid[0, 1].item() * grid[0, 2].item() / merge**2)
 
         vs_id = self.processor.tokenizer.convert_tokens_to_ids("<|vision_start|>")
         ids   = inputs["input_ids"][0]
@@ -445,34 +374,18 @@ class QwenWithClusterPredictorAndSAE(nn.Module):
             mask &= (ids != s)
         return v_pos, n_img, mask.nonzero(as_tuple=False).squeeze(-1)
 
-    # ── Patch index → 2D grid coordinates ────────────────────────────────────
-
-    def _patch_indices_to_2d(self, indices):
-        """将 flat patch indices 转换为 (row, col) grid 坐标。
-
-        Qwen-VL 的 vision tokens 按 row-major 排列：
-        patch_0 = (0,0), patch_1 = (0,1), ..., patch_{W-1} = (0, W-1),
-        patch_W = (1,0), ...
-
-        Args:
-            indices: (K,) LongTensor — patch 在 flat vision token 序列中的索引
-
-        Returns:
-            rows: (K,) LongTensor
-            cols: (K,) LongTensor
-        """
-        grid_h, grid_w = self._cached_grid_hw
-        rows = indices // grid_w
-        cols = indices % grid_w
-        return rows, cols
-
     # ── 中间层 Hook（核心）────────────────────────────────────────────────────
-
     def _mid_layer_hook(self, module, input, output):
+        """
+        Post-hook on self._layers[inject_layer].
+
+        HOOK_READ_ONLY  → 预测 cluster，stash logits，不修改 hidden
+        HOOK_READ_WRITE → 预测 cluster + 稀疏局部注入
+        """
         if self._hook_fired:
             return output
 
-        hs = output[0]
+        hs = output[0]  # (B, seq, dim)
         if hs.shape[1] <= 1:
             return output
 
@@ -486,13 +399,16 @@ class QwenWithClusterPredictorAndSAE(nn.Module):
         h_vision_float = hs[0, v_pos:v_pos + n_img, :].float()
         self._stashed_h_vision = h_vision_float
 
-        probs_with_grad = torch.sigmoid(logits)[0]
+        probs_with_grad = torch.sigmoid(logits)[0]  # (n_clusters,) 连续权重
         probs_detached = probs_with_grad.detach()
 
+        # ── [修复位置] 先把 top_cids 计算出来 ──────────────────────────────────
         top_k_clusters = min(self.top_k_clusters, len(probs_with_grad))
         _, top_cids = torch.topk(probs_detached, top_k_clusters)
         top_cids = top_cids.tolist()
 
+        # ── [修复位置] 现在可以安全地使用 top_cids 记录用于打印了 ──────────────
+        # 把刚才算好的 top_cids 存下来，过滤掉概率小于 0.1 的用于 verbose 打印
         self._last_cluster_ids = [cid for cid in top_cids if probs_detached[cid] > 0.1]
         self._last_cluster_probs = probs_with_grad
 
@@ -500,7 +416,8 @@ class QwenWithClusterPredictorAndSAE(nn.Module):
         if self._hook_mode == self.HOOK_READ_ONLY:
             return output
 
-        # ── Stage 2 / 推理: 连续加权稀疏注入 + 空间交互 ─────────────────────
+        # ── Stage 2 / 推理: 连续加权稀疏注入 ─────────────────────────────────
+        # 这里的 top_cids 已经算好了，直接传给 _build_sparse_injection
         injection = self._build_sparse_injection(
             hs, top_cids, probs_with_grad, v_pos, n_img, text_pos,
         )
@@ -509,22 +426,23 @@ class QwenWithClusterPredictorAndSAE(nn.Module):
 
         active_indices, recon_projected = injection
 
+        # 取出激活 patches 的 vision hidden，做 sparse local cross-attention
         hs_mod = hs.clone()
-        vision_active = hs_mod[0, v_pos + active_indices, :].float()
+        vision_active = hs_mod[0, v_pos + active_indices, :].float()  # (K, dim)
 
-        # Step A: Semantic Cross-Attention（patch-wise 语义注入）
+        # cross-attention: Q=vision_active, K/V=recon_projected
         updated = self.semantic_cross_attn(vision_active, recon_projected)
 
-        # Step B: Spatial Patch Interaction（patch 间空间推理）
-        rows, cols = self._patch_indices_to_2d(active_indices)
-        updated = self.spatial_interaction(updated, rows, cols)
-
-        # 写回
+        # 写回：只修改激活的 patches
         hs_mod[0, v_pos + active_indices, :] = updated.to(hs.dtype)
 
         return (hs_mod,) + output[1:]
 
     def _suppress_hook(self, module, input, output):
+        """Post-hook on self._layers[suppress_layer].
+        削弱 vision tokens 的主成分，让模型看图更分散。
+        只在 prefill 时触发一次。
+        """
         if self._suppress_hook_fired:
             return output
 
@@ -537,6 +455,8 @@ class QwenWithClusterPredictorAndSAE(nn.Module):
 
         hs_mod = hs.clone()
         vision_h = hs_mod[0, v_pos:v_pos + n_img, :].float()
+
+        # 削弱主成分
         suppressed = self.pc_suppressor(vision_h)
         hs_mod[0, v_pos:v_pos + n_img, :] = suppressed.to(hs.dtype)
 
@@ -554,6 +474,7 @@ class QwenWithClusterPredictorAndSAE(nn.Module):
         self._last_cluster_probs = None
         handles = []
         handles.append(self._layers[self.inject_layer].register_forward_hook(self._mid_layer_hook))
+        # suppress hook 只在 READ_WRITE 模式注册（Stage 2 / 推理）
         if mode == self.HOOK_READ_WRITE:
             handles.append(self._layers[self.suppress_layer].register_forward_hook(self._suppress_hook))
         return handles
@@ -566,13 +487,33 @@ class QwenWithClusterPredictorAndSAE(nn.Module):
     # ── 稀疏注入构造 ─────────────────────────────────────────────────────────
 
     def _build_sparse_injection(self, h, cluster_ids, cluster_probs, v_pos, n_img, text_pos):
+        """
+        Sparse Local Injection + Semantic Completion
+
+        流程：
+        1. SAE encode 所有 vision patches → 稀疏激活 z
+        2. 对每个激活的 cluster：
+           a. 找到该 cluster 激活强度 top-k 的 patches
+           b. 只保留该 cluster 的 SAE 激活，零出其余 → z_cluster
+           c. SemanticCompleter: Δz = f(text_h, z_cluster) — 补全缺失语义
+           d. z_completed = z_cluster + Δz
+           e. SAE decode(z_completed) → 包含补全语义的重构
+           f. 乘以带梯度的 cluster prob
+        3. 多个 cluster 的重构累加
+        4. ExtraProjector 投影
+
+        Returns:
+            None 如果没有激活的 patches
+            (active_indices, recon_projected)
+        """
         flat = h[:, v_pos:v_pos + n_img, :].reshape(-1, h.shape[-1]).float()
         n_patches = flat.shape[0]
 
-        text_h = h[0, text_pos[-1], :].float()
+        # 提取 text hidden（last token）用于 semantic completion
+        text_h = h[0, text_pos[-1], :].float()  # (dim,)
 
         with torch.no_grad():
-            z = self.sae.encode(flat)
+            z = self.sae.encode(flat)  # (n_patches, latent_dim)
 
         patch_recon = torch.zeros(n_patches, flat.shape[-1], device=flat.device)
         patch_activated = torch.zeros(n_patches, dtype=torch.bool, device=flat.device)
@@ -595,9 +536,12 @@ class QwenWithClusterPredictorAndSAE(nn.Module):
             z_sub = z[topk_idx]
             z_cluster[:, fids] = z_sub[:, fids]
 
-            delta_z = self.semantic_completer(text_h, z_cluster)
+            # ── Semantic Completion: 补全缺失语义 ────────────────────────────
+            # Δz = f(text_h, z_cluster): "为了回答这个问题，这些 patch 还缺什么"
+            delta_z = self.semantic_completer(text_h, z_cluster)  # (k, latent_dim)
             z_completed = z_cluster + delta_z
 
+            # SAE decode 包含补全信息的 latent
             with torch.no_grad():
                 recon = self.sae.decoder(z_completed)
 
@@ -653,12 +597,9 @@ class QwenWithClusterPredictorAndSAE(nn.Module):
 
         if verbose:
             print(f"  Vision tokens : {n_img}")
-            print(f"  Grid (H×W)    : {self._cached_grid_hw}")
             print(f"  Clusters      : {cids} → {cnames}")
             lam = F.softplus(self.semantic_cross_attn.lambda_param).item()
-            gam = F.softplus(self.spatial_interaction.gamma_param).item()
-            print(f"  λ_semantic    : {lam:.4f}")
-            print(f"  γ_spatial     : {gam:.4f}")
+            print(f"  λ (softplus)  : {lam:.4f}")
 
         return {
             "cluster_ids":   cids,
@@ -758,7 +699,6 @@ class QwenWithClusterPredictorAndSAE(nn.Module):
             "image_cluster_scorer": self.image_cluster_scorer.state_dict(),
             "extra_projector":      self.extra_projector.state_dict(),
             "semantic_cross_attn":  self.semantic_cross_attn.state_dict(),
-            "spatial_interaction":  self.spatial_interaction.state_dict(),
             "pc_suppressor":        self.pc_suppressor.state_dict(),
             "semantic_completer":   self.semantic_completer.state_dict(),
         }, path)
@@ -770,7 +710,6 @@ class QwenWithClusterPredictorAndSAE(nn.Module):
             for k in [
                 "cluster_predictor", "image_cluster_scorer",
                 "extra_projector", "semantic_cross_attn",
-                "spatial_interaction",
                 "pc_suppressor", "semantic_completer",
             ]:
                 if k in state:
@@ -780,7 +719,6 @@ class QwenWithClusterPredictorAndSAE(nn.Module):
         for m in [
             self.cluster_predictor, self.image_cluster_scorer,
             self.extra_projector, self.semantic_cross_attn,
-            self.spatial_interaction,
             self.pc_suppressor, self.semantic_completer,
         ]:
             m.to(self.device)
@@ -790,12 +728,12 @@ class QwenWithClusterPredictorAndSAE(nn.Module):
         return self.base_model(**kwargs)
 
     @classmethod
+    #目前最优抑制成分个数为3
     def from_pretrained(cls, model_id, sae_ckpt_dir, cluster_path,
                         inject_layer=8, suppress_layer=-8, n_suppress_pcs=3,
                         latent_mult=8, topk=32, top_n_patches=60,
                         top_k_clusters=10, cluster_threshold=0.5,
                         bce_lambda=0.5, align_lambda=0.3,
-                        spatial_n_heads=4, spatial_n_dist_bins=32,
                         predictor_ckpt=None, device="cuda"):
         from transformers import AutoProcessor, Qwen2_5_VLForConditionalGeneration
 
@@ -823,8 +761,6 @@ class QwenWithClusterPredictorAndSAE(nn.Module):
             top_k_clusters=top_k_clusters,
             cluster_threshold=cluster_threshold,
             bce_lambda=bce_lambda, align_lambda=align_lambda,
-            spatial_n_heads=spatial_n_heads,
-            spatial_n_dist_bins=spatial_n_dist_bins,
         )
 
         if predictor_ckpt and os.path.exists(predictor_ckpt):
@@ -836,7 +772,6 @@ class QwenWithClusterPredictorAndSAE(nn.Module):
             for m in [
                 model.cluster_predictor, model.image_cluster_scorer,
                 model.extra_projector, model.semantic_cross_attn,
-                model.spatial_interaction,
                 model.pc_suppressor, model.semantic_completer,
             ]
         )
