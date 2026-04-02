@@ -122,6 +122,13 @@ python eval/eval_cvbench.py --mode enhanced --qwen_ckpt outputs/focus_ckpt/qwen_
 CUDA_VISIBLE_DEVICES=1 python eval/eval_cvbench_copy.py --mode enhanced --qwen_ckpt outputs/focus_ckpt_0.75_best/qwen_best.pt
 
 
-python -m src.train_focus_copy --stage 1 && python -m src.train_focus_copy --stage 2 --resume best && python eval/eval_cvbench_copy.py --mode enhanced
+CUDA_VISIBLE_DEVICES=1 python -m src.train_focus_copy --stage 1 && python -m src.train_focus_copy --stage 2 --resume best && python eval/eval_cvbench_copy.py --mode enhanced
 
 python -m ablation.train_no_pcs --stage 1 && python -m ablation.train_no_pcs --stage 2 --resume best && python eval/eval_cvbench.py --mode no_pcs --no_pcs_qwen_ckpt outputs/ablation_no_pcs/qwen_best.pt
+
+
+
+CUDA_VISIBLE_DEVICES=1 python eval/eval_mmstar.py --mode enhanced
+
+
+CUDA_VISIBLE_DEVICES=1 python eval/eval_cvbench.py --mode enhanced --qwen_ckpt outputs/focus_ckpt/qwen_best.pt

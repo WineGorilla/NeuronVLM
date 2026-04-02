@@ -1,14 +1,11 @@
 """
-CV-Bench 评估脚本。
+CV-Bench 评估脚本 — LLaVA-OneVision 版
 
 用法：
-    python eval/eval_cvbench.py --mode base
-    python eval/eval_cvbench.py --mode enhanced
-    python eval/eval_cvbench.py --mode finetune_baseline --qwen_ckpt outputs/ablation_baseline/qwen_best.pt
-    python eval/eval_cvbench.py --mode both
-    python eval/eval_cvbench.py --mode all --qwen_ckpt outputs/ablation_baseline/qwen_best.pt
-    python eval/eval_cvbench.py --mode both --max_samples 50
-    python eval/eval_cvbench.py --mode no_pcs --no_pcs_qwen_ckpt outputs/ablation_no_pcs/qwen_best.pt
+    python eval/eval_cvbench_llava.py --mode base
+    python eval/eval_cvbench_llava.py --mode enhanced
+    python eval/eval_cvbench_llava.py --mode both
+    python eval/eval_cvbench_llava.py --mode both --max_samples 50
 """
 import os
 import sys
@@ -20,9 +17,12 @@ from collections import defaultdict
 sys.path.insert(0, os.path.dirname(os.path.dirname(__file__)))
 
 import torch
+import transformers
 from datasets import load_dataset
 from PIL import Image
 from tqdm import tqdm
+
+transformers.logging.set_verbosity_error()
 
 from config import CFG
 
@@ -47,13 +47,13 @@ def extract_choice_letter(response: str) -> str | None:
     text = response.strip().split("\n")[0].strip().upper()
     if not text:
         return None
-    m = re.search(r'\(([A-D])\)', text)
+    m = re.search(r'\(([A-Z])\)', text)
     if m:
         return f"({m.group(1)})"
-    m = re.search(r'(?:ANSWER|OPTION)\s*(?:IS|:)?\s*\(?([A-D])\)?', text)
+    m = re.search(r'(?:ANSWER|OPTION)\s*(?:IS|:)?\s*\(?([A-Z])\)?', text)
     if m:
         return f"({m.group(1)})"
-    m = re.match(r'^([A-D])(?:[\s.,):]|$)', text)
+    m = re.match(r'^([A-Z])(?:[\s.,):]|$)', text)
     if m:
         return f"({m.group(1)})"
     return None
@@ -79,55 +79,30 @@ def match_answer(response: str, choices: list, answer: str) -> tuple[bool, str |
 
 # ── 加载模型 ──────────────────────────────────────────────────────────────────
 
-def load_base_model():
-    """原始 Qwen2.5-VL，无任何改动。"""
-    from transformers import Qwen2_5_VLForConditionalGeneration, AutoProcessor
+def load_base_model(model_id):
+    """原始 LLaVA-OneVision，无任何改动。"""
+    from transformers import LlavaOnevisionForConditionalGeneration, AutoProcessor
 
-    print("Loading vanilla Qwen2.5-VL for baseline...")
-    processor = AutoProcessor.from_pretrained(CFG.model_id)
-    base_model = Qwen2_5_VLForConditionalGeneration.from_pretrained(
-        CFG.model_id,
+    print(f"Loading vanilla LLaVA-OneVision: {model_id}...")
+    processor = AutoProcessor.from_pretrained(model_id)
+    base_model = LlavaOnevisionForConditionalGeneration.from_pretrained(
+        model_id,
         torch_dtype=torch.float16,
         device_map=CFG.device,
     )
     base_model.eval()
+    base_model.generation_config.pad_token_id = processor.tokenizer.eos_token_id
     return base_model, processor
-
-
-def load_finetune_baseline(qwen_ckpt):
-    """原始 Qwen2.5-VL + finetune 过的 top-8 层权重，无 hook / 额外模块。
-    用于 ablation：验证提升来自架构还是数据。
-    """
-    from transformers import Qwen2_5_VLForConditionalGeneration, AutoProcessor
-
-    print("Loading finetune baseline (Qwen + finetuned layers, no hooks)...")
-    processor = AutoProcessor.from_pretrained(CFG.model_id)
-    model = Qwen2_5_VLForConditionalGeneration.from_pretrained(
-        CFG.model_id,
-        torch_dtype=torch.float16,
-        device_map=CFG.device,
-    )
-
-    if qwen_ckpt and os.path.exists(qwen_ckpt):
-        print(f"  Loading finetuned weights: {qwen_ckpt}")
-        state = torch.load(qwen_ckpt, map_location="cpu")
-        model.load_state_dict(state, strict=False)
-        print(f"  Loaded {len(state)} weight tensors.")
-    else:
-        print(f"  WARNING: --qwen_ckpt not provided or not found, using vanilla model!")
-
-    model.eval()
-    return model, processor
 
 
 def load_enhanced_model(args):
     """带 ClusterPredictor + SAE + SemanticCompleter + PCS 的增强模型。"""
-    from src.Model import QwenWithClusterPredictorAndSAE
+    from src.Model_llava import LlavaOVWithClusterPredictorAndSAE
 
-    print("Loading enhanced model (ClusterPredictor + SAE)...")
+    print("Loading enhanced LLaVA-OneVision model...")
     cluster_path = os.path.join(CFG.label_dir, f"feature_clusters_layer{args.layer}.json")
-    model = QwenWithClusterPredictorAndSAE.from_pretrained(
-        model_id=CFG.model_id,
+    model = LlavaOVWithClusterPredictorAndSAE.from_pretrained(
+        model_id=args.llava_model_id,
         sae_ckpt_dir=CFG.save_dir,
         cluster_path=cluster_path,
         inject_layer=args.layer,
@@ -137,37 +112,10 @@ def load_enhanced_model(args):
         predictor_ckpt=args.predictor_ckpt,
         device=CFG.device,
     )
-    if args.qwen_ckpt and os.path.exists(args.qwen_ckpt):
-        state = torch.load(args.qwen_ckpt, map_location="cpu")
+    if args.llava_ckpt and os.path.exists(args.llava_ckpt):
+        state = torch.load(args.llava_ckpt, map_location="cpu")
         model.load_state_dict(state, strict=False)
         print("  Enhanced model weights (Stage 2) loaded.")
-
-    model.to(CFG.device)
-    model.eval()
-    return model
-
-
-def load_enhanced_model_no_pcs(args):
-    """消融版增强模型：无 PCA suppression，其余与完整版一致。"""
-    from ablation.Model_no_pcs import QwenWithClusterPredictorAndSAE
-
-    print("Loading enhanced model (NO PCS ablation)...")
-    cluster_path = os.path.join(CFG.label_dir, f"feature_clusters_layer{args.layer}.json")
-    model = QwenWithClusterPredictorAndSAE.from_pretrained(
-        model_id=CFG.model_id,
-        sae_ckpt_dir=CFG.save_dir,
-        cluster_path=cluster_path,
-        inject_layer=args.layer,
-        latent_mult=CFG.latent_mult,
-        topk=CFG.topk,
-        top_n_patches=CFG.top_n_patches,
-        predictor_ckpt=args.no_pcs_predictor_ckpt,
-        device=CFG.device,
-    )
-    if args.no_pcs_qwen_ckpt and os.path.exists(args.no_pcs_qwen_ckpt):
-        state = torch.load(args.no_pcs_qwen_ckpt, map_location="cpu")
-        model.load_state_dict(state, strict=False)
-        print("  No-PCS model weights loaded.")
 
     model.to(CFG.device)
     model.eval()
@@ -177,9 +125,7 @@ def load_enhanced_model_no_pcs(args):
 # ── 评估循环 ──────────────────────────────────────────────────────────────────
 
 def evaluate_base(base_model, processor, dataset, save_path=None, label="base"):
-    """用原始或 finetune 过的 Qwen2.5-VL 评估（无 hook）。"""
-    from qwen_vl_utils import process_vision_info
-
+    """用原始 LLaVA-OneVision 评估（无 hook）。"""
     print(f"\n{'='*60}")
     print(f"Evaluating: {label}")
     print(f"{'='*60}")
@@ -193,32 +139,29 @@ def evaluate_base(base_model, processor, dataset, save_path=None, label="base"):
 
         prompt_text = build_prompt(prompt, choices)
 
-        tmp_path = "/tmp/cvbench_tmp.png"
-        if isinstance(image, Image.Image):
-            image.save(tmp_path)
-        else:
-            tmp_path = image
+        # 确保是 PIL Image
+        if isinstance(image, str):
+            image = Image.open(image).convert("RGB")
+        elif not isinstance(image, Image.Image):
+            image = image.convert("RGB")
 
         response = ""
         try:
-            messages = [
+            conversation = [
                 {
                     "role": "user",
                     "content": [
-                        {"type": "image", "image": f"file://{tmp_path}"},
+                        {"type": "image"},
                         {"type": "text", "text": prompt_text},
                     ],
                 }
             ]
             text = processor.apply_chat_template(
-                messages, tokenize=False, add_generation_prompt=True
+                conversation, add_generation_prompt=True
             )
-            image_inputs, video_inputs = process_vision_info(messages)
             inputs = processor(
-                text=[text],
-                images=image_inputs,
-                videos=video_inputs,
-                padding=True,
+                images=image,
+                text=text,
                 return_tensors="pt",
             ).to(base_model.device)
 
@@ -255,14 +198,14 @@ def evaluate_base(base_model, processor, dataset, save_path=None, label="base"):
     return results
 
 
-def evaluate_enhanced(model, dataset, save_path=None):
-    """用增强模型（ClusterPredictor + SAE）评估。"""
+def evaluate_enhanced(model, dataset, save_path=None, label="enhanced"):
+    """用增强模型评估。"""
     print(f"\n{'='*60}")
-    print(f"Evaluating: enhanced (ClusterPredictor + SAE)")
+    print(f"Evaluating: {label}")
     print(f"{'='*60}")
 
     results = []
-    for item in tqdm(dataset, desc="enhanced eval"):
+    for item in tqdm(dataset, desc=f"{label} eval"):
         image = item["image"]
         prompt = item["prompt"]
         answer = item["answer"]
@@ -270,11 +213,15 @@ def evaluate_enhanced(model, dataset, save_path=None):
 
         prompt_text = build_prompt(prompt, choices)
 
-        tmp_path = "/tmp/cvbench_tmp.png"
-        if isinstance(image, Image.Image):
-            image.save(tmp_path)
-        else:
-            tmp_path = image
+        # LLaVA-OV 的 generate 支持直接传 PIL Image
+        if isinstance(image, str):
+            image = Image.open(image).convert("RGB")
+        elif not isinstance(image, Image.Image):
+            image = image.convert("RGB")
+
+        # 保存临时文件（Model_llava.generate 接受 image_path 或 PIL Image）
+        tmp_path = "/tmp/cvbench_llava_tmp.png"
+        image.save(tmp_path)
 
         response = ""
         cluster_ids = []
@@ -374,7 +321,7 @@ def compute_metrics(results, label=""):
 
 
 def print_comparison(metrics_dict):
-    """打印多个模型的对比表。metrics_dict: {label: metrics}"""
+    """打印多个模型的对比表。"""
     labels = list(metrics_dict.keys())
     if len(labels) < 2:
         return
@@ -383,16 +330,13 @@ def print_comparison(metrics_dict):
     print(f"  CV-Bench Comparison")
     print(f"{'='*70}")
 
-    # Header
     header = f"  {'Metric':<25s}"
     for label in labels:
         header += f" {label:>12s}"
-    if len(labels) >= 2:
-        header += f" {'Delta':>8s}"
+    header += f" {'Delta':>8s}"
     print(header)
     print(f"  {'─'*60}")
 
-    # Rows
     rows = [
         ("CV-Bench Overall", "cv_bench"),
         ("2D Accuracy", "acc_2d"),
@@ -406,12 +350,10 @@ def print_comparison(metrics_dict):
         vals = [metrics_dict[l][key] for l in labels]
         for v in vals:
             line += f" {v:12.2f}"
-        if len(vals) >= 2:
-            d = vals[-1] - vals[0]
-            line += f" {'+'if d>0 else ''}{d:7.2f}"
+        d = vals[-1] - vals[0]
+        line += f" {'+'if d>0 else ''}{d:7.2f}"
         print(line)
 
-    # Per-task
     all_tasks = sorted(set(
         t for m in metrics_dict.values() for t in m["per_task"]
     ))
@@ -421,9 +363,8 @@ def print_comparison(metrics_dict):
         vals = [metrics_dict[l]["per_task"].get(t, 0) for l in labels]
         for v in vals:
             line += f" {v:12.2f}"
-        if len(vals) >= 2:
-            d = vals[-1] - vals[0]
-            line += f" {'+'if d>0 else ''}{d:7.2f}"
+        d = vals[-1] - vals[0]
+        line += f" {'+'if d>0 else ''}{d:7.2f}"
         print(line)
 
     print(f"  {'─'*60}")
@@ -439,20 +380,17 @@ def print_comparison(metrics_dict):
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--mode", type=str, default="both",
-                        choices=["base", "enhanced", "no_pcs", "finetune_baseline", "both", "all"])
+                        choices=["base", "enhanced", "both"])
+    parser.add_argument("--llava_model_id", type=str,
+                        default="llava-hf/llava-onevision-qwen2-7b-ov-hf",
+                        help="HuggingFace model ID for LLaVA-OneVision")
     parser.add_argument("--layer", type=int, default=CFG.vis_layer)
-    parser.add_argument("--predictor_ckpt", type=str, default="outputs/focus_ckpt/predictor_best.pt")
-    parser.add_argument("--qwen_ckpt", type=str, default=None,
-                        help="For enhanced: Stage 2 weights. For finetune_baseline: ablation weights.")
-    parser.add_argument("--baseline_ckpt", type=str, default=None,
-                        help="Finetune baseline weights (used in --mode all)")
-    parser.add_argument("--no_pcs_predictor_ckpt", type=str,
-                        default="outputs/ablation_no_pcs/predictor_best.pt",
-                        help="No-PCS ablation predictor weights")
-    parser.add_argument("--no_pcs_qwen_ckpt", type=str, default=None,
-                        help="No-PCS ablation LM weights")
+    parser.add_argument("--predictor_ckpt", type=str,
+                        default="outputs/llava_ckpt/predictor_best.pt")
+    parser.add_argument("--llava_ckpt", type=str, default=None,
+                        help="Stage 2 finetuned weights for enhanced model")
     parser.add_argument("--subset", type=str, default=None, choices=["2D", "3D"])
-    parser.add_argument("--save_dir", type=str, default="outputs/cvbench_results")
+    parser.add_argument("--save_dir", type=str, default="outputs/cvbench_results_llava")
     parser.add_argument("--max_samples", type=int, default=None)
     args = parser.parse_args()
 
@@ -477,55 +415,30 @@ def main():
     # ── 评估 ──
     all_metrics = {}
 
-    run_base     = args.mode in ["base", "both", "all"]
-    run_ft_base  = args.mode in ["finetune_baseline", "all"]
-    run_no_pcs   = args.mode in ["no_pcs", "all"]
-    run_enhanced = args.mode in ["enhanced", "both", "all"]
+    run_base     = args.mode in ["base", "both"]
+    run_enhanced = args.mode in ["enhanced", "both"]
 
-    # 1. Base (vanilla Qwen)
+    # 1. Base (vanilla LLaVA-OneVision)
     if run_base:
-        base_model, processor = load_base_model()
+        base_model, processor = load_base_model(args.llava_model_id)
         res = evaluate_base(
             base_model, processor, ds,
             save_path=os.path.join(args.save_dir, "base_results.json"),
-            label="base (vanilla)",
+            label="base (vanilla LLaVA-OV)",
         )
-        all_metrics["base"] = compute_metrics(res, label="Base Qwen2.5-VL")
+        all_metrics["base"] = compute_metrics(res, label="Base LLaVA-OneVision")
         del base_model, processor
         torch.cuda.empty_cache()
 
-    # 2. Finetune baseline (same data, no hooks)
-    if run_ft_base:
-        ft_ckpt = args.baseline_ckpt or args.qwen_ckpt
-        ft_model, ft_processor = load_finetune_baseline(ft_ckpt)
-        res = evaluate_base(
-            ft_model, ft_processor, ds,
-            save_path=os.path.join(args.save_dir, "finetune_baseline_results.json"),
-            label="finetune_baseline",
-        )
-        all_metrics["finetune_baseline"] = compute_metrics(res, label="Finetune Baseline (no hooks)")
-        del ft_model, ft_processor
-        torch.cuda.empty_cache()
-
-    # 3. No-PCS ablation (full architecture minus PCA suppression)
-    if run_no_pcs:
-        no_pcs_model = load_enhanced_model_no_pcs(args)
-        res = evaluate_enhanced(
-            no_pcs_model, ds,
-            save_path=os.path.join(args.save_dir, "no_pcs_results.json"),
-        )
-        all_metrics["no_pcs"] = compute_metrics(res, label="Enhanced (no PCS)")
-        del no_pcs_model
-        torch.cuda.empty_cache()
-
-    # 4. Enhanced (full architecture)
+    # 2. Enhanced (ClusterPredictor + SAE + SemanticCompleter + PCS)
     if run_enhanced:
         enhanced_model = load_enhanced_model(args)
         res = evaluate_enhanced(
             enhanced_model, ds,
             save_path=os.path.join(args.save_dir, "enhanced_results.json"),
+            label="enhanced (LLaVA-OV)",
         )
-        all_metrics["enhanced"] = compute_metrics(res, label="Enhanced")
+        all_metrics["enhanced"] = compute_metrics(res, label="Enhanced LLaVA-OneVision")
         del enhanced_model
         torch.cuda.empty_cache()
 

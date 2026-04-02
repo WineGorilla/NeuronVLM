@@ -1,32 +1,22 @@
 """
-QwenWithClusterPredictorAndSAE — Single-Forward, Sparse Local Injection
+LlavaOVWithClusterPredictorAndSAE — LLaVA-OneVision 适配版
 
-核心思想：
-  所有语义决策和注入都发生在 transformer 的中间层（inject_layer）的 post-hook 内。
-  一次 forward，一个 hidden state，一个 truth。
+从 QwenWithClusterPredictorAndSAE 移植而来。
+核心的 hook 注入逻辑、SAE 稀疏注入、SemanticCompleter、PCA Suppressor 完全复用，
+只适配了以下 LLaVA-OneVision 特有的部分：
 
-注入策略 — Sparse Local Cross-Attention：
-  不再把所有 cluster 信息 pool 成全局 extra tokens 广播给所有 vision patches。
-  而是：找到每个 cluster 激活的 top-k patches，只让这些 patches 和自己的 SAE 重构
-  做 cross-attention。未激活的 patches 完全不动。
+适配点：
+  1. _find_layers:   LLaVA-OV 的 transformer layers 路径
+  2. _build_inputs:  LLaVA-OV 的 processor 和 conversation template
+  3. _get_token_positions: LLaVA-OV 的 vision token 定位（<image> token 展开后的位置）
+  4. _build_labels:  LLaVA-OV 的 chat template 格式
+  5. from_pretrained: LLaVA-OV 的模型加载
 
-  vision[active] = CrossAttn(Q=vision[active], K=recon[active], V=recon[active])
-  vision[inactive] = vision[inactive]  # untouched
-
-推理流程（单次 forward）：
-  1. 图片+问题 → Qwen forward 开始
-  2. Layer 0..N-1 正常执行
-  3. Layer N (inject_layer) 执行完毕 → post-hook 触发：
-     a. ClusterPredictor: text hidden → 预测哪些语义 cluster 被激活
-     b. SAE encode vision patches → 按 cluster 筛选 top-k activated patches
-     c. SAE decode → 每个 patch 的纯净语义重构
-     d. Sparse local cross-attention: 只修改激活的 patches
-  4. Layer N+1..末尾 使用修改后的 hidden 继续
-  5. generate() 输出
-
-训练流程：
-  Stage 1: hook 只读 — 预测 cluster，计算 BCE + alignment loss，不修改 hidden
-  Stage 2: hook 读写 — 预测 cluster + 稀疏注入，联合 LM + BCE + alignment loss
+LLaVA-OneVision 架构要点：
+  - LLM backbone: Qwen2 (与 Qwen2.5-VL 共享 backbone 家族)
+  - Vision encoder: SigLIP → MLP projector → LLM token 序列
+  - Vision tokens 通过 <image> placeholder 展开后拼入 LLM 输入序列
+  - 支持动态分辨率 (anyres)
 """
 import os
 import json
@@ -36,15 +26,10 @@ import torch.nn.functional as F
 from typing import Optional, List, Tuple, Dict, Any
 from src.SAE import SAE
 
-
-# ── 子模块 ────────────────────────────────────────────────────────────────────
+# ── 复用的子模块（与 Qwen 版完全相同）─────────────────────────────────────────
 
 class ClusterPredictor(nn.Module):
-    """Text hidden → cluster logits
-
-    使用最后一个 text token 的 hidden state（Causal LM 中聚合了全部上文语义），
-    而非 mean pooling（会掺杂缺乏上下文的早期 token，导致语义稀释）。
-    """
+    """Text hidden → cluster logits"""
     def __init__(self, dim: int, n_clusters: int):
         super().__init__()
         self.head = nn.Sequential(
@@ -54,7 +39,6 @@ class ClusterPredictor(nn.Module):
         )
 
     def forward(self, h, text_pos):
-        # 取出所有的 text tokens 并求均值，作为整体的语义特征
         text_h_all = h[:, text_pos, :]
         mean_text_h = text_h_all.mean(dim=1).float()
         return self.head(mean_text_h)
@@ -87,14 +71,7 @@ class ExtraProjector(nn.Module):
 
 
 class SemanticCrossAttention(nn.Module):
-    """Sparse local cross-attention: 只更新被选中的 vision patches
-
-    Q = selected vision patches (from hidden state)
-    K, V = their SAE reconstructed semantic features (projected)
-
-    Zero-Init 策略：out_proj 权重初始化为 0，lambda 初始化为极小值，
-    确保训练初期注入量严格为 0，模型等价于原始预训练模型。
-    """
+    """Sparse local cross-attention: 只更新被选中的 vision patches"""
     def __init__(self, dim: int):
         super().__init__()
         self.dim = dim
@@ -103,20 +80,10 @@ class SemanticCrossAttention(nn.Module):
         self.v_proj   = nn.Linear(dim, dim, bias=False)
         self.out_proj = nn.Linear(dim, dim, bias=False)
         self.norm     = nn.LayerNorm(dim)
-        # Near-zero init: 初始注入量极小但梯度非零，避免 zero-init 死锁
-        # std=0.001 × softplus(-3.0)≈0.049 → 初始扰动 < 0.00005，安全
         nn.init.normal_(self.out_proj.weight, std=0.001)
-        # 超参数 目前分数最高是0.75
         self.lambda_param = nn.Parameter(torch.tensor(0.75))
 
     def forward(self, vision, extra):
-        """
-        Args:
-            vision: (N, dim) — selected vision patch hidden states
-            extra:  (N, dim) — corresponding SAE reconstructed features (projected)
-        Returns:
-            (N, dim) — updated vision patches
-        """
         lam = F.softplus(self.lambda_param)
         Q = self.q_proj(vision)
         K = self.k_proj(extra)
@@ -126,119 +93,63 @@ class SemanticCrossAttention(nn.Module):
 
 
 class PrincipalComponentSuppressor(nn.Module):
-    """在靠后层削弱 vision tokens 的主成分，迫使模型分散注意力。
-
-    原理：
-      vision patches 的 hidden states 通常被少数主成分主导（比如"大物体的轮廓"），
-      导致模型忽略空间关系、小物体计数等细节。削弱 top-k 主成分后，
-      次要特征（位置、相对距离、小物体）的信号占比上升。
-
-    实现：
-      1. 对 vision tokens 做 SVD
-      2. 投影到 top-k 主成分方向
-      3. 从原始 hidden 中减去 alpha * 主成分投影
-      alpha 可学习，初始化接近 0
-    """
+    """削弱 vision tokens 主成分，迫使模型分散注意力"""
     def __init__(self, n_suppress: int = 3):
         super().__init__()
         self.n_suppress = n_suppress
-        # softplus(-3.0) ≈ 0.049，初始几乎不抑制
         self.alpha_param = nn.Parameter(torch.tensor(-3.0))
 
     def forward(self, vision_h):
-        """
-        Args:
-            vision_h: (N, dim) vision patch hidden states (float)
-        Returns:
-            (N, dim) 主成分被削弱后的 vision hidden states
-        """
         alpha = F.softplus(self.alpha_param)
         N, D = vision_h.shape
-
         if N <= self.n_suppress:
             return vision_h
-
         mean = vision_h.mean(dim=0, keepdim=True)
         centered = vision_h - mean
-
         U, S, V = torch.svd_lowrank(centered, q=self.n_suppress)
-
-        # 主成分分量 = 投影到主成分空间再投影回来
-        proj = centered @ V @ V.T  # (N, D)
-
+        proj = centered @ V @ V.T
         return vision_h - alpha * proj
 
 
 class SemanticCompleter(nn.Module):
-    """根据问题语义，预测 SAE latent 空间中应该补充的缺失信息 Δz。
-
-    从 perception → reasoning 的跨越：
-      不只是从已有的 SAE latent 里挑选（重排），
-      而是根据问题推断"当前视觉表示缺了什么"，在 latent 空间补全。
-
-    设计（轻量 bottleneck 版）：
-      latent_dim 通常很大（7168），不能在 latent 空间做全连接。
-      改用 hidden_dim 空间的 bottleneck：
-      1. text_h (dim) → bottleneck (dim//4) → scale vector (dim)
-      2. z_cluster (k, latent_dim) 先通过 SAE decoder 映射到 hidden_dim 空间
-         → 在 hidden_dim 空间做 gating → 再通过 SAE encoder 映射回 latent 空间
-      但这样太复杂。更简单的方案：
-      直接在 latent 空间用 per-cluster-feature 的标量 gate：
-      1. text_h → 一个小向量 (n_clusters 维或 bottleneck 维)
-      2. 广播为 latent_dim 的 sparse mask（利用已有的 cluster_to_features 映射）
-
-    最终方案（极简高效）：
-      text_h (dim) → MLP → (n_clusters,) 维的 modulation weights
-      对每个 cluster，modulation weight 控制该 cluster 的 Δz 强度。
-      Δz 本身 = z_cluster 自己（self-reinforcement）* modulation。
-      这样参数量 = dim * n_clusters 级别，极小。
-    """
-    def __init__(self, dim: int, latent_dim: int, n_clusters: int = None, bottleneck: int = 128):
+    """根据问题语义，预测 SAE latent 空间中应该补充的缺失信息 Δz"""
+    def __init__(self, dim: int, latent_dim: int, n_clusters: int = None,
+                 bottleneck: int = 128):
         super().__init__()
         self.latent_dim = latent_dim
-        # text_h → bottleneck → latent_dim 的 delta 方向
-        # 用 bottleneck 避免 latent_dim × latent_dim 的大矩阵
         self.text_to_delta = nn.Sequential(
             nn.Linear(dim, bottleneck),
             nn.ReLU(),
             nn.Linear(bottleneck, bottleneck),
         )
-        # z_cluster 压缩到 bottleneck 空间做 gating
         self.z_to_gate = nn.Sequential(
             nn.Linear(latent_dim, bottleneck),
             nn.Sigmoid(),
         )
-        # bottleneck → latent_dim 的稀疏投影
         self.delta_proj = nn.Linear(bottleneck, latent_dim, bias=False)
         nn.init.normal_(self.delta_proj.weight, std=0.001)
-        # 可学习的整体强度
         self.beta_param = nn.Parameter(torch.tensor(-3.0))
 
     def forward(self, text_h, z_cluster):
-        """
-        Args:
-            text_h:    (dim,)          — 问题语义
-            z_cluster: (k, latent_dim) — patches 的 SAE 激活
-        Returns:
-            delta_z: (k, latent_dim) — 需要补充的 latent 修正
-        """
         beta = F.softplus(self.beta_param)
-        # text → "需要什么" 的 bottleneck 表示
-        text_bn = self.text_to_delta(text_h)       # (bottleneck,)
-        # z_cluster → "有什么" 的 gate
-        gate = self.z_to_gate(z_cluster)            # (k, bottleneck)
-        # 交汇：gate * text_bn → 投影回 latent 空间
-        fused = gate * text_bn.unsqueeze(0)         # (k, bottleneck)
-        delta_z = beta * self.delta_proj(fused)     # (k, latent_dim)
+        text_bn = self.text_to_delta(text_h)
+        gate = self.z_to_gate(z_cluster)
+        fused = gate * text_bn.unsqueeze(0)
+        delta_z = beta * self.delta_proj(fused)
         return delta_z
 
 
-# ── 自动探测 transformer layers ───────────────────────────────────────────────
+# ── 自动探测 transformer layers（LLaVA-OneVision 适配）────────────────────────
 
 def _find_layers(model):
+    """
+    LLaVA-OneVision 的 layers 路径：
+      model.language_model.model.layers  (最常见)
+      model.model.layers                 (某些封装方式)
+    """
     for path in [
+        lambda m: m.language_model.model.layers,    # LlavaOnevisionForConditionalGeneration
         lambda m: m.model.language_model.model.layers,
-        lambda m: m.model.language_model.layers,
         lambda m: m.model.layers,
     ]:
         try:
@@ -248,14 +159,14 @@ def _find_layers(model):
         except AttributeError:
             pass
     raise AttributeError(
-        "Cannot find transformer layers. Run: "
-        "print([n for n,_ in model.named_modules() if 'layers.0' in n][:5])"
+        "Cannot find transformer layers in LLaVA-OneVision model. Run:\n"
+        "  print([n for n,_ in model.named_modules() if 'layers.0' in n][:5])"
     )
 
 
 # ── 主模型 ────────────────────────────────────────────────────────────────────
 
-class QwenWithClusterPredictorAndSAE(nn.Module):
+class LlavaOVWithClusterPredictorAndSAE(nn.Module):
 
     HOOK_OFF       = 0
     HOOK_READ_ONLY = 1
@@ -287,8 +198,10 @@ class QwenWithClusterPredictorAndSAE(nn.Module):
             self.cluster_to_features.setdefault(cid, []).append(fid)
         self.n_clusters = len(self.clusters)
 
-        dim    = base_model.config.text_config.hidden_size
-        latent_dim = sae.latent_dim  # SAE 的 latent 维度
+        # ── LLaVA-OV: hidden_size 从 text_config 获取 ────────────────────────
+        # LlavaOnevisionConfig 把 LLM config 放在 text_config 里
+        dim = base_model.config.text_config.hidden_size
+        latent_dim = sae.latent_dim
         device = next(base_model.parameters()).device
 
         self.cluster_predictor    = ClusterPredictor(dim, self.n_clusters).to(device)
@@ -302,7 +215,6 @@ class QwenWithClusterPredictorAndSAE(nn.Module):
         n_layers = len(self._layers)
         print(f"  Found {n_layers} transformer layers")
 
-        # suppress_layer 支持负数索引（如 -8 表示倒数第 8 层）
         self.suppress_layer = suppress_layer if suppress_layer >= 0 else n_layers + suppress_layer
         print(f"  Inject @ layer {self.inject_layer}, Suppress @ layer {self.suppress_layer}")
 
@@ -326,66 +238,146 @@ class QwenWithClusterPredictorAndSAE(nn.Module):
     def device(self):
         return next(self.base_model.parameters()).device
 
-    # ── 输入构建 ──────────────────────────────────────────────────────────────
+    # ── 输入构建（LLaVA-OneVision 适配）───────────────────────────────────────
 
     def _build_inputs(self, image_path, question, answer=None, for_generation=True):
-        from qwen_vl_utils import process_vision_info
-        msg = [{
-            "role": "user",
-            "content": [
-                {"type": "image", "image": image_path},
-                {"type": "text",  "text":  question},
-            ],
-        }]
+        """
+        LLaVA-OneVision 使用 LlavaOnevisionProcessor:
+          - 图片通过 processor 的 image_processor 处理
+          - 文本中用 <image> placeholder 标记图片位置
+          - conversation template 使用 chatml 格式（和 Qwen 类似）
+
+        关键区别：
+          - Qwen2.5-VL: process_vision_info() + processor(text, images)
+          - LLaVA-OV:   processor(text_with_<image>, images=PIL_images)
+        """
+        from PIL import Image
+
+        # 加载图片
+        if isinstance(image_path, str):
+            image = Image.open(image_path).convert("RGB")
+        else:
+            image = image_path  # 已经是 PIL Image
+
+        # ── 构建 conversation ─────────────────────────────────────────────────
+        # LLaVA-OneVision 使用 apply_chat_template，格式类似 chatml
+        conversation = [
+            {
+                "role": "user",
+                "content": [
+                    {"type": "image"},
+                    {"type": "text", "text": question},
+                ],
+            },
+        ]
         if answer is not None:
-            msg.append({"role": "assistant", "content": answer})
+            conversation.append({
+                "role": "assistant",
+                "content": [
+                    {"type": "text", "text": answer},
+                ],
+            })
             for_generation = False
-        messages = [msg]
-        texts = [self.processor.apply_chat_template(
-            m, tokenize=False, add_generation_prompt=for_generation
-        ) for m in messages]
-        img_in, vid_in = process_vision_info(messages)
-        inputs = self.processor(
-            text=texts, images=img_in, videos=vid_in,
-            padding=True, return_tensors="pt",
+
+        # apply_chat_template 生成带 <image> placeholder 的文本
+        prompt = self.processor.apply_chat_template(
+            conversation,
+            add_generation_prompt=for_generation,
         )
+
+        # processor 处理：图片 + 文本 → model inputs
+        inputs = self.processor(
+            images=image,
+            text=prompt,
+            return_tensors="pt",
+        )
+
         return inputs.to(self.device)
 
     def _get_token_positions(self, inputs):
-        grid = inputs["image_grid_thw"]
-        merge = self.base_model.config.vision_config.spatial_merge_size
-        n_img = int(grid[0, 1].item() * grid[0, 2].item() / merge**2)
+        """
+        LLaVA-OneVision vision token 定位：
 
-        vs_id = self.processor.tokenizer.convert_tokens_to_ids("<|vision_start|>")
-        ids   = inputs["input_ids"][0]
-        v_pos = (ids == vs_id).nonzero()[0].item() + 1
+        与 Qwen2.5-VL 的区别：
+          - Qwen: <|vision_start|> ... vision tokens ... <|vision_end|>
+          - LLaVA-OV: <image> 被展开为连续的 vision feature tokens
 
-        special = {
-            self.processor.tokenizer.convert_tokens_to_ids(t)
-            for t in [
-                "<|im_start|>", "<|im_end|>",
-                "<|vision_start|>", "<|vision_end|>",
-            ]
-            if self.processor.tokenizer.convert_tokens_to_ids(t) is not None
-        }
+        LLaVA-OV 的 processor 输出中包含 `image_sizes` 和 `pixel_values`，
+        但 vision token 的数量需要从实际的 input_ids 中推断：
+          - LlavaOnevisionProcessor 使用 `image_token_index` (默认 32000)
+            作为 <image> token 的 ID
+          - 在 prepare_inputs_for_generation 中，<image> tokens 被替换为
+            vision encoder 输出的 feature tokens
+          - 在 forward 中，model 内部会找到所有 image_token_index 位置并替换
+
+        所以在 hook 触发时（forward 已经开始），vision tokens 已经被展开。
+        我们需要：
+          1. 找到 input_ids 中 image_token_index 的起始位置和数量
+          2. 这些位置在 hidden states 中对应 vision tokens
+        """
+        ids = inputs["input_ids"][0]
+
+        # ── 获取 image token ID ───────────────────────────────────────────────
+        # LlavaOnevisionConfig.image_token_index，默认 151646
+        # 不同版本可能不同，优先从 config 读取
+        image_token_id = getattr(
+            self.base_model.config, "image_token_index",
+            self.processor.tokenizer.convert_tokens_to_ids("<image>"),
+        )
+
+        # 找到所有 image token 位置
+        image_mask = (ids == image_token_id)
+        image_positions = image_mask.nonzero(as_tuple=False).squeeze(-1)
+
+        if image_positions.numel() == 0:
+            raise ValueError(
+                f"No image tokens found in input_ids. "
+                f"image_token_id={image_token_id}, "
+                f"unique ids: {ids.unique().tolist()[:20]}"
+            )
+
+        # vision tokens 是连续的一段
+        v_pos = image_positions[0].item()
+        n_img = image_positions.numel()
+
+        # ── text token 位置（排除 vision tokens 和 special tokens）────────────
+        # LLaVA-OV 使用 chatml 格式的 special tokens
+        tokenizer = self.processor.tokenizer
+        special_ids = set()
+
+        # 常见的 special token 名称（不同 LLaVA-OV 版本可能略有不同）
+        for token_name in [
+            "<|im_start|>", "<|im_end|>",    # chatml 格式
+            "<image>",                         # image placeholder
+            "<s>", "</s>",                     # BOS/EOS
+            "<pad>",                           # padding
+        ]:
+            tid = tokenizer.convert_tokens_to_ids(token_name)
+            if tid is not None and tid != tokenizer.unk_token_id:
+                special_ids.add(tid)
+
+        # 也加入 bos/eos/pad token ids
+        for attr in ["bos_token_id", "eos_token_id", "pad_token_id"]:
+            tid = getattr(tokenizer, attr, None)
+            if tid is not None:
+                special_ids.add(tid)
+
         mask = torch.ones(len(ids), dtype=torch.bool, device=ids.device)
-        mask[v_pos:v_pos + n_img] = False
-        for s in special:
+        mask[v_pos:v_pos + n_img] = False  # 排除 vision tokens
+        for s in special_ids:
             mask &= (ids != s)
-        return v_pos, n_img, mask.nonzero(as_tuple=False).squeeze(-1)
 
-    # ── 中间层 Hook（核心）────────────────────────────────────────────────────
+        text_pos = mask.nonzero(as_tuple=False).squeeze(-1)
+
+        return v_pos, n_img, text_pos
+
+    # ── 中间层 Hook（与 Qwen 版完全相同）──────────────────────────────────────
+
     def _mid_layer_hook(self, module, input, output):
-        """
-        Post-hook on self._layers[inject_layer].
-
-        HOOK_READ_ONLY  → 预测 cluster，stash logits，不修改 hidden
-        HOOK_READ_WRITE → 预测 cluster + 稀疏局部注入
-        """
         if self._hook_fired:
             return output
 
-        hs = output[0]  # (B, seq, dim)
+        hs = output[0]
         if hs.shape[1] <= 1:
             return output
 
@@ -399,25 +391,20 @@ class QwenWithClusterPredictorAndSAE(nn.Module):
         h_vision_float = hs[0, v_pos:v_pos + n_img, :].float()
         self._stashed_h_vision = h_vision_float
 
-        probs_with_grad = torch.sigmoid(logits)[0]  # (n_clusters,) 连续权重
+        probs_with_grad = torch.sigmoid(logits)[0]
         probs_detached = probs_with_grad.detach()
 
-        # ── [修复位置] 先把 top_cids 计算出来 ──────────────────────────────────
         top_k_clusters = min(self.top_k_clusters, len(probs_with_grad))
         _, top_cids = torch.topk(probs_detached, top_k_clusters)
         top_cids = top_cids.tolist()
 
-        # ── [修复位置] 现在可以安全地使用 top_cids 记录用于打印了 ──────────────
-        # 把刚才算好的 top_cids 存下来，过滤掉概率小于 0.1 的用于 verbose 打印
         self._last_cluster_ids = [cid for cid in top_cids if probs_detached[cid] > 0.1]
         self._last_cluster_probs = probs_with_grad
 
-        # ── Stage 1: 只读 ────────────────────────────────────────────────────
         if self._hook_mode == self.HOOK_READ_ONLY:
             return output
 
         # ── Stage 2 / 推理: 连续加权稀疏注入 ─────────────────────────────────
-        # 这里的 top_cids 已经算好了，直接传给 _build_sparse_injection
         injection = self._build_sparse_injection(
             hs, top_cids, probs_with_grad, v_pos, n_img, text_pos,
         )
@@ -426,23 +413,14 @@ class QwenWithClusterPredictorAndSAE(nn.Module):
 
         active_indices, recon_projected = injection
 
-        # 取出激活 patches 的 vision hidden，做 sparse local cross-attention
         hs_mod = hs.clone()
-        vision_active = hs_mod[0, v_pos + active_indices, :].float()  # (K, dim)
-
-        # cross-attention: Q=vision_active, K/V=recon_projected
+        vision_active = hs_mod[0, v_pos + active_indices, :].float()
         updated = self.semantic_cross_attn(vision_active, recon_projected)
-
-        # 写回：只修改激活的 patches
         hs_mod[0, v_pos + active_indices, :] = updated.to(hs.dtype)
 
         return (hs_mod,) + output[1:]
 
     def _suppress_hook(self, module, input, output):
-        """Post-hook on self._layers[suppress_layer].
-        削弱 vision tokens 的主成分，让模型看图更分散。
-        只在 prefill 时触发一次。
-        """
         if self._suppress_hook_fired:
             return output
 
@@ -455,14 +433,12 @@ class QwenWithClusterPredictorAndSAE(nn.Module):
 
         hs_mod = hs.clone()
         vision_h = hs_mod[0, v_pos:v_pos + n_img, :].float()
-
-        # 削弱主成分
         suppressed = self.pc_suppressor(vision_h)
         hs_mod[0, v_pos:v_pos + n_img, :] = suppressed.to(hs.dtype)
 
         return (hs_mod,) + output[1:]
 
-    # ── Hook 生命周期管理 ─────────────────────────────────────────────────────
+    # ── Hook 生命周期管理（与 Qwen 版相同）────────────────────────────────────
 
     def _activate_hook(self, mode: int):
         self._hook_mode = mode
@@ -474,7 +450,6 @@ class QwenWithClusterPredictorAndSAE(nn.Module):
         self._last_cluster_probs = None
         handles = []
         handles.append(self._layers[self.inject_layer].register_forward_hook(self._mid_layer_hook))
-        # suppress hook 只在 READ_WRITE 模式注册（Stage 2 / 推理）
         if mode == self.HOOK_READ_WRITE:
             handles.append(self._layers[self.suppress_layer].register_forward_hook(self._suppress_hook))
         return handles
@@ -484,36 +459,16 @@ class QwenWithClusterPredictorAndSAE(nn.Module):
             h.remove()
         self._hook_mode = self.HOOK_OFF
 
-    # ── 稀疏注入构造 ─────────────────────────────────────────────────────────
+    # ── 稀疏注入构造（与 Qwen 版完全相同）────────────────────────────────────
 
     def _build_sparse_injection(self, h, cluster_ids, cluster_probs, v_pos, n_img, text_pos):
-        """
-        Sparse Local Injection + Semantic Completion
-
-        流程：
-        1. SAE encode 所有 vision patches → 稀疏激活 z
-        2. 对每个激活的 cluster：
-           a. 找到该 cluster 激活强度 top-k 的 patches
-           b. 只保留该 cluster 的 SAE 激活，零出其余 → z_cluster
-           c. SemanticCompleter: Δz = f(text_h, z_cluster) — 补全缺失语义
-           d. z_completed = z_cluster + Δz
-           e. SAE decode(z_completed) → 包含补全语义的重构
-           f. 乘以带梯度的 cluster prob
-        3. 多个 cluster 的重构累加
-        4. ExtraProjector 投影
-
-        Returns:
-            None 如果没有激活的 patches
-            (active_indices, recon_projected)
-        """
         flat = h[:, v_pos:v_pos + n_img, :].reshape(-1, h.shape[-1]).float()
         n_patches = flat.shape[0]
 
-        # 提取 text hidden（last token）用于 semantic completion
-        text_h = h[0, text_pos[-1], :].float()  # (dim,)
+        text_h = h[0, text_pos[-1], :].float()
 
         with torch.no_grad():
-            z = self.sae.encode(flat)  # (n_patches, latent_dim)
+            z = self.sae.encode(flat)
 
         patch_recon = torch.zeros(n_patches, flat.shape[-1], device=flat.device)
         patch_activated = torch.zeros(n_patches, dtype=torch.bool, device=flat.device)
@@ -536,12 +491,9 @@ class QwenWithClusterPredictorAndSAE(nn.Module):
             z_sub = z[topk_idx]
             z_cluster[:, fids] = z_sub[:, fids]
 
-            # ── Semantic Completion: 补全缺失语义 ────────────────────────────
-            # Δz = f(text_h, z_cluster): "为了回答这个问题，这些 patch 还缺什么"
-            delta_z = self.semantic_completer(text_h, z_cluster)  # (k, latent_dim)
+            delta_z = self.semantic_completer(text_h, z_cluster)
             z_completed = z_cluster + delta_z
 
-            # SAE decode 包含补全信息的 latent
             with torch.no_grad():
                 recon = self.sae.decoder(z_completed)
 
@@ -678,20 +630,55 @@ class QwenWithClusterPredictorAndSAE(nn.Module):
         return total, lm_loss.item(), bce_val
 
     def _build_labels(self, input_ids):
+        """
+        LLaVA-OneVision label 构建。
+
+        LLaVA-OV 使用 chatml 格式（和 Qwen 一样）：
+          <|im_start|>user\n...<|im_end|>\n<|im_start|>assistant\n...<|im_end|>
+
+        只对最后一个 assistant turn 的内容计算 loss。
+
+        注意：不同 LLaVA-OV 版本可能使用不同的 chat template：
+          - 基于 Qwen2 的版本: chatml 格式（<|im_start|>/<|im_end|>）
+          - 基于 Llama 的版本: llama chat 格式
+        这里优先尝试 chatml，回退到通用的 assistant 标记方式。
+        """
         labels = input_ids.clone()
-        im_start = self.processor.tokenizer.convert_tokens_to_ids("<|im_start|>")
-        ast_ids  = self.processor.tokenizer.encode("assistant", add_special_tokens=False)
-        for b in range(input_ids.shape[0]):
-            ids = input_ids[b].tolist()
-            start = None
-            for i in range(len(ids) - 2, -1, -1):
-                if ids[i] == im_start and ids[i+1:i+1+len(ast_ids)] == ast_ids:
-                    start = i + 1 + len(ast_ids) + 1
-                    break
-            labels[b, :start if start else len(ids)] = -100
+        tokenizer = self.processor.tokenizer
+
+        # 尝试 chatml 格式
+        im_start = tokenizer.convert_tokens_to_ids("<|im_start|>")
+
+        if im_start is not None and im_start != tokenizer.unk_token_id:
+            # chatml 格式：找最后一个 <|im_start|>assistant
+            ast_ids = tokenizer.encode("assistant", add_special_tokens=False)
+            for b in range(input_ids.shape[0]):
+                ids = input_ids[b].tolist()
+                start = None
+                for i in range(len(ids) - 2, -1, -1):
+                    if ids[i] == im_start and ids[i+1:i+1+len(ast_ids)] == ast_ids:
+                        start = i + 1 + len(ast_ids) + 1  # skip "assistant\n"
+                        break
+                labels[b, :start if start else len(ids)] = -100
+        else:
+            # 回退：找 [/INST] 或其他 assistant 标记
+            # 对于 Llama-based LLaVA，assistant 回复在 [/INST] 之后
+            inst_end = tokenizer.encode("[/INST]", add_special_tokens=False)
+            for b in range(input_ids.shape[0]):
+                ids = input_ids[b].tolist()
+                start = None
+                for i in range(len(ids) - len(inst_end), -1, -1):
+                    if ids[i:i+len(inst_end)] == inst_end:
+                        start = i + len(inst_end)
+                        break
+                if start is None:
+                    # 最后的回退：mask 掉前 80% 的 tokens
+                    start = int(len(ids) * 0.8)
+                labels[b, :start] = -100
+
         return labels.to(self.device)
 
-    # ── 保存 / 加载 ──────────────────────────────────────────────────────────
+    # ── 保存 / 加载（与 Qwen 版相同）──────────────────────────────────────────
 
     def save_predictor(self, path):
         torch.save({
@@ -728,18 +715,28 @@ class QwenWithClusterPredictorAndSAE(nn.Module):
         return self.base_model(**kwargs)
 
     @classmethod
-    #目前最优抑制成分个数为3
     def from_pretrained(cls, model_id, sae_ckpt_dir, cluster_path,
                         inject_layer=8, suppress_layer=-8, n_suppress_pcs=2,
                         latent_mult=8, topk=32, top_n_patches=60,
                         top_k_clusters=10, cluster_threshold=0.5,
                         bce_lambda=0.5, align_lambda=0.3,
                         predictor_ckpt=None, device="cuda"):
-        from transformers import AutoProcessor, Qwen2_5_VLForConditionalGeneration
+        """
+        加载 LLaVA-OneVision 模型。
 
-        print(f"Loading Qwen: {model_id}...")
-        processor  = AutoProcessor.from_pretrained(model_id)
-        base_model = Qwen2_5_VLForConditionalGeneration.from_pretrained(
+        常用 model_id:
+          - "llava-hf/llava-onevision-qwen2-7b-ov-hf"     (7B)
+          - "llava-hf/llava-onevision-qwen2-0.5b-ov-hf"   (0.5B)
+          - "llava-hf/llava-onevision-qwen2-72b-ov-hf"    (72B)
+
+        注意：LLaVA-OV 的 SAE 需要单独在 LLaVA-OV 上训练，
+        不能直接复用 Qwen2.5-VL 训练的 SAE（hidden_size 可能相同但特征空间不同）。
+        """
+        from transformers import AutoProcessor, LlavaOnevisionForConditionalGeneration
+
+        print(f"Loading LLaVA-OneVision: {model_id}...")
+        processor = AutoProcessor.from_pretrained(model_id)
+        base_model = LlavaOnevisionForConditionalGeneration.from_pretrained(
             model_id, torch_dtype=torch.bfloat16,
         ).to(device)
 

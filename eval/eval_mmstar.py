@@ -1,15 +1,15 @@
 """
-CV-Bench 评估脚本。
+MMStar 评估脚本。
+
+MMStar: 1500 道选择题，6 大能力维度，每题必须看图才能答对。
+数据集字段：index, question, image, answer, category, l2_category
 
 用法：
-    python eval/eval_cvbench.py --mode base
-    python eval/eval_cvbench.py --mode enhanced
-    python eval/eval_cvbench.py --mode spatial --qwen_ckpt outputs/focus_v2_ckpt/qwen_best.pt
-    python eval/eval_cvbench.py --mode finetune_baseline --qwen_ckpt outputs/ablation_baseline/qwen_best.pt
-    python eval/eval_cvbench.py --mode no_pcs --no_pcs_qwen_ckpt outputs/ablation_no_pcs/qwen_best.pt
-    python eval/eval_cvbench.py --mode both
-    python eval/eval_cvbench.py --mode all --qwen_ckpt outputs/ablation_baseline/qwen_best.pt
-    python eval/eval_cvbench.py --mode both --max_samples 50
+    python eval/eval_mmstar.py --mode base
+    python eval/eval_mmstar.py --mode enhanced
+    python eval/eval_mmstar.py --mode both
+    python eval/eval_mmstar.py --mode all --qwen_ckpt outputs/ablation_baseline/qwen_best.pt
+    python eval/eval_mmstar.py --mode both --max_samples 100
 """
 import os
 import sys
@@ -30,16 +30,17 @@ from config import CFG
 
 # ── Prompt 构造 ───────────────────────────────────────────────────────────────
 
-def build_prompt(prompt: str, choices: list) -> str:
-    choice_text = "\n".join(
-        [f"{chr(ord('A') + i)}. {c}" for i, c in enumerate(choices)]
-    )
+def build_prompt(question: str) -> str:
+    """
+    MMStar 的 question 字段已经包含了选项（A. xxx\nB. xxx\n...），
+    只需要加上指令即可。
+    """
     instruction = (
         "Answer the following question.\n"
-        "Select the correct option and output ONLY the letter.\n"
-        "Do NOT output explanation.\n"
+        "Select the correct option and output ONLY the letter (A, B, C, or D).\n"
+        "Do NOT output explanation.\n\n"
     )
-    return f"{instruction}\n{prompt}\n\nChoices:\n{choice_text}\n\nAnswer:"
+    return f"{instruction}{question}\n\nAnswer:"
 
 
 # ── 答案匹配 ──────────────────────────────────────────────────────────────────
@@ -48,40 +49,36 @@ def extract_choice_letter(response: str) -> str | None:
     text = response.strip().split("\n")[0].strip().upper()
     if not text:
         return None
-    m = re.search(r'\(([A-Z])\)', text)
+    # 直接匹配单个字母
+    m = re.match(r'^([A-D])(?:[\s.,):]|$)', text)
     if m:
-        return f"({m.group(1)})"
-    m = re.search(r'(?:ANSWER|OPTION)\s*(?:IS|:)?\s*\(?([A-Z])\)?', text)
+        return m.group(1)
+    # 匹配 (A) 格式
+    m = re.search(r'\(([A-D])\)', text)
     if m:
-        return f"({m.group(1)})"
-    m = re.match(r'^([A-Z])(?:[\s.,):]|$)', text)
+        return m.group(1)
+    # 匹配 "Answer is A" 格式
+    m = re.search(r'(?:ANSWER|OPTION)\s*(?:IS|:)?\s*\(?([A-D])\)?', text)
     if m:
-        return f"({m.group(1)})"
+        return m.group(1)
+    # 回退：找到第一个 A-D 字母
+    m = re.search(r'([A-D])', text)
+    if m:
+        return m.group(1)
     return None
 
 
-def match_by_content(response: str, choices: list) -> str | None:
-    resp = response.strip().split("\n")[0].strip().lower()
-    for i, choice in enumerate(choices):
-        if resp == str(choice).strip().lower():
-            return f"({chr(ord('A') + i)})"
-    return None
-
-
-def match_answer(response: str, choices: list, answer: str) -> tuple[bool, str | None]:
+def match_answer(response: str, answer: str) -> tuple[bool, str | None]:
+    """MMStar 的 answer 是单个字母如 'A', 'B', 'C', 'D'"""
     extracted = extract_choice_letter(response)
     if extracted is not None:
-        return extracted == answer, extracted
-    extracted = match_by_content(response, choices)
-    if extracted is not None:
-        return extracted == answer, extracted
+        return extracted == answer.strip().upper(), extracted
     return False, None
 
 
 # ── 加载模型 ──────────────────────────────────────────────────────────────────
 
 def load_base_model():
-    """原始 Qwen2.5-VL，无任何改动。"""
     from transformers import Qwen2_5_VLForConditionalGeneration, AutoProcessor
 
     print("Loading vanilla Qwen2.5-VL for baseline...")
@@ -96,34 +93,29 @@ def load_base_model():
 
 
 def load_finetune_baseline(qwen_ckpt):
-    """原始 Qwen2.5-VL + finetune 过的 top-8 层权重，无 hook / 额外模块。"""
     from transformers import Qwen2_5_VLForConditionalGeneration, AutoProcessor
 
-    print("Loading finetune baseline (Qwen + finetuned layers, no hooks)...")
+    print("Loading finetune baseline...")
     processor = AutoProcessor.from_pretrained(CFG.model_id)
     model = Qwen2_5_VLForConditionalGeneration.from_pretrained(
         CFG.model_id,
         torch_dtype=torch.float16,
         device_map=CFG.device,
     )
-
     if qwen_ckpt and os.path.exists(qwen_ckpt):
-        print(f"  Loading finetuned weights: {qwen_ckpt}")
         state = torch.load(qwen_ckpt, map_location="cpu")
         model.load_state_dict(state, strict=False)
         print(f"  Loaded {len(state)} weight tensors.")
     else:
-        print(f"  WARNING: --qwen_ckpt not provided or not found, using vanilla model!")
-
+        print("  WARNING: --qwen_ckpt not found, using vanilla model!")
     model.eval()
     return model, processor
 
 
 def load_enhanced_model(args):
-    """带 ClusterPredictor + SAE + SemanticCompleter + PCS 的增强模型（无 spatial）。"""
-    from src.Model_copy import QwenWithClusterPredictorAndSAE
+    from src.Model import QwenWithClusterPredictorAndSAE
 
-    print("Loading enhanced model (ClusterPredictor + SAE)...")
+    print("Loading enhanced model...")
     cluster_path = os.path.join(CFG.label_dir, f"feature_clusters_layer{args.layer}.json")
     model = QwenWithClusterPredictorAndSAE.from_pretrained(
         model_id=CFG.model_id,
@@ -139,45 +131,16 @@ def load_enhanced_model(args):
     if args.qwen_ckpt and os.path.exists(args.qwen_ckpt):
         state = torch.load(args.qwen_ckpt, map_location="cpu")
         model.load_state_dict(state, strict=False)
-        print("  Enhanced model weights (Stage 2) loaded.")
-
-    model.to(CFG.device)
-    model.eval()
-    return model
-
-
-def load_spatial_model(args):
-    """带 SpatialPatchInteraction 的 v2 增强模型。"""
-    from src.Model_v2 import QwenWithClusterPredictorAndSAE
-
-    print("Loading spatial model (Model_v2: enhanced + SpatialPatchInteraction)...")
-    cluster_path = os.path.join(CFG.label_dir, f"feature_clusters_layer{args.layer}.json")
-    model = QwenWithClusterPredictorAndSAE.from_pretrained(
-        model_id=CFG.model_id,
-        sae_ckpt_dir=CFG.save_dir,
-        cluster_path=cluster_path,
-        inject_layer=args.layer,
-        latent_mult=CFG.latent_mult,
-        topk=CFG.topk,
-        top_n_patches=CFG.top_n_patches,
-        predictor_ckpt=args.spatial_predictor_ckpt,
-        device=CFG.device,
-    )
-    if args.spatial_qwen_ckpt and os.path.exists(args.spatial_qwen_ckpt):
-        state = torch.load(args.spatial_qwen_ckpt, map_location="cpu")
-        model.load_state_dict(state, strict=False)
-        print("  Spatial model weights (Stage 2) loaded.")
-
+        print("  Enhanced model weights loaded.")
     model.to(CFG.device)
     model.eval()
     return model
 
 
 def load_enhanced_model_no_pcs(args):
-    """消融版增强模型：无 PCA suppression。"""
     from ablation.Model_no_pcs import QwenWithClusterPredictorAndSAE
 
-    print("Loading enhanced model (NO PCS ablation)...")
+    print("Loading enhanced model (NO PCS)...")
     cluster_path = os.path.join(CFG.label_dir, f"feature_clusters_layer{args.layer}.json")
     model = QwenWithClusterPredictorAndSAE.from_pretrained(
         model_id=CFG.model_id,
@@ -194,7 +157,6 @@ def load_enhanced_model_no_pcs(args):
         state = torch.load(args.no_pcs_qwen_ckpt, map_location="cpu")
         model.load_state_dict(state, strict=False)
         print("  No-PCS model weights loaded.")
-
     model.to(CFG.device)
     model.eval()
     return model
@@ -203,7 +165,6 @@ def load_enhanced_model_no_pcs(args):
 # ── 评估循环 ──────────────────────────────────────────────────────────────────
 
 def evaluate_base(base_model, processor, dataset, save_path=None, label="base"):
-    """用原始或 finetune 过的 Qwen2.5-VL 评估（无 hook）。"""
     from qwen_vl_utils import process_vision_info
 
     print(f"\n{'='*60}")
@@ -213,13 +174,14 @@ def evaluate_base(base_model, processor, dataset, save_path=None, label="base"):
     results = []
     for item in tqdm(dataset, desc=f"{label} eval"):
         image = item["image"]
-        prompt = item["prompt"]
+        question = item["question"]
         answer = item["answer"]
-        choices = item["choices"]
+        category = item["category"]
+        l2_category = item["l2_category"]
 
-        prompt_text = build_prompt(prompt, choices)
+        prompt_text = build_prompt(question)
 
-        tmp_path = "/tmp/cvbench_tmp.png"
+        tmp_path = "/tmp/mmstar_tmp.png"
         if isinstance(image, Image.Image):
             image.save(tmp_path)
         else:
@@ -259,14 +221,13 @@ def evaluate_base(base_model, processor, dataset, save_path=None, label="base"):
                 output_ids[0, input_len:], skip_special_tokens=True
             ).strip()
         except Exception as e:
-            print(f"  [error] idx={item['idx']}: {e}")
+            print(f"  [error] idx={item['index']}: {e}")
 
-        correct, extracted = match_answer(response, choices, answer)
+        correct, extracted = match_answer(response, answer)
         results.append({
-            "idx": item["idx"],
-            "task": item["task"],
-            "source": item["source"],
-            "type": item["type"],
+            "index": item["index"],
+            "category": category,
+            "l2_category": l2_category,
             "answer": answer,
             "response": response,
             "extracted": extracted,
@@ -282,7 +243,6 @@ def evaluate_base(base_model, processor, dataset, save_path=None, label="base"):
 
 
 def evaluate_enhanced(model, dataset, save_path=None, label="enhanced"):
-    """用增强模型评估（enhanced 或 spatial 均可）。"""
     print(f"\n{'='*60}")
     print(f"Evaluating: {label}")
     print(f"{'='*60}")
@@ -290,13 +250,14 @@ def evaluate_enhanced(model, dataset, save_path=None, label="enhanced"):
     results = []
     for item in tqdm(dataset, desc=f"{label} eval"):
         image = item["image"]
-        prompt = item["prompt"]
+        question = item["question"]
         answer = item["answer"]
-        choices = item["choices"]
+        category = item["category"]
+        l2_category = item["l2_category"]
 
-        prompt_text = build_prompt(prompt, choices)
+        prompt_text = build_prompt(question)
 
-        tmp_path = "/tmp/cvbench_tmp.png"
+        tmp_path = "/tmp/mmstar_tmp.png"
         if isinstance(image, Image.Image):
             image.save(tmp_path)
         else:
@@ -313,14 +274,13 @@ def evaluate_enhanced(model, dataset, save_path=None, label="enhanced"):
             response = result["final_answer"]
             cluster_ids = result.get("cluster_ids", [])
         except Exception as e:
-            print(f"  [error] idx={item['idx']}: {e}")
+            print(f"  [error] idx={item['index']}: {e}")
 
-        correct, extracted = match_answer(response, choices, answer)
+        correct, extracted = match_answer(response, answer)
         results.append({
-            "idx": item["idx"],
-            "task": item["task"],
-            "source": item["source"],
-            "type": item["type"],
+            "index": item["index"],
+            "category": category,
+            "l2_category": l2_category,
             "answer": answer,
             "response": response,
             "extracted": extracted,
@@ -339,11 +299,11 @@ def evaluate_enhanced(model, dataset, save_path=None, label="enhanced"):
 # ── 统计 ──────────────────────────────────────────────────────────────────────
 
 def compute_metrics(results, label=""):
-    by_source = defaultdict(list)
-    by_task   = defaultdict(list)
+    by_category    = defaultdict(list)
+    by_l2_category = defaultdict(list)
     for r in results:
-        by_source[r["source"]].append(r)
-        by_task[r["task"]].append(r)
+        by_category[r["category"]].append(r)
+        by_l2_category[r["l2_category"]].append(r)
 
     def acc(items):
         if not items:
@@ -352,105 +312,93 @@ def compute_metrics(results, label=""):
 
     n_unparsed = sum(1 for r in results if r.get("extracted") is None)
     n_total = len(results)
+    overall_acc = acc(results)
+
     if n_unparsed > 0:
         pct = n_unparsed / n_total * 100
         print(f"\n  [warning] {n_unparsed}/{n_total} ({pct:.1f}%) responses could not be parsed")
-        unparsed_by_task = defaultdict(int)
-        for r in results:
-            if r.get("extracted") is None:
-                unparsed_by_task[r["task"]] += 1
-        for t, c in sorted(unparsed_by_task.items()):
-            total_t = len(by_task[t])
-            print(f"    {t}: {c}/{total_t} unparsed")
         samples = [r for r in results if r.get("extracted") is None][:3]
         for s in samples:
-            print(f"    example: task={s['task']} ans={s['answer']}")
+            print(f"    example: cat={s['category']} ans={s['answer']}")
             print(f"      resp=\"{s['response'][:100]}\"")
 
-    acc_ade  = acc(by_source.get("ADE20K", []))
-    acc_coco = acc(by_source.get("COCO", []))
-    acc_omni = acc(by_source.get("Omni3D", []))
-    acc_2d   = (acc_ade + acc_coco) / 2
-    acc_3d   = acc_omni
-    cv_bench = (acc_2d + acc_3d) / 2
-
     print(f"\n{'='*60}")
-    print(f"  CV-Bench Results: {label}")
+    print(f"  MMStar Results: {label}")
     print(f"{'='*60}")
-    print(f"  CV-Bench Overall : {cv_bench:.2f}")
-    print(f"  2D Accuracy      : {acc_2d:.2f}")
-    print(f"    ADE20K         : {acc_ade:.2f}  (n={len(by_source.get('ADE20K', []))})")
-    print(f"    COCO           : {acc_coco:.2f}  (n={len(by_source.get('COCO', []))})")
-    print(f"  3D Accuracy      : {acc_3d:.2f}")
-    print(f"    Omni3D         : {acc_omni:.2f}  (n={len(by_source.get('Omni3D', []))})")
+    print(f"  Overall Accuracy : {overall_acc:.2f}  (n={n_total})")
     print(f"{'─'*60}")
-    print(f"  Per-Task:")
-    for task_name in sorted(by_task.keys()):
-        items = by_task[task_name]
-        print(f"    {task_name:20s}: {acc(items):6.2f}  (n={len(items)})")
+    print(f"  Per Category (L1):")
+    cat_accs = {}
+    for cat_name in sorted(by_category.keys()):
+        items = by_category[cat_name]
+        a = acc(items)
+        cat_accs[cat_name] = a
+        print(f"    {cat_name:30s}: {a:6.2f}  (n={len(items)})")
+
+    print(f"{'─'*60}")
+    print(f"  Per Category (L2):")
+    l2_accs = {}
+    for cat_name in sorted(by_l2_category.keys()):
+        items = by_l2_category[cat_name]
+        a = acc(items)
+        l2_accs[cat_name] = a
+        print(f"    {cat_name:30s}: {a:6.2f}  (n={len(items)})")
+
+    print(f"{'─'*60}")
     print(f"  Unparsed: {n_unparsed}/{n_total}")
     print(f"{'='*60}")
 
     return {
-        "cv_bench": cv_bench, "acc_2d": acc_2d, "acc_3d": acc_3d,
-        "acc_ade": acc_ade, "acc_coco": acc_coco, "acc_omni": acc_omni,
-        "per_task": {t: acc(items) for t, items in by_task.items()},
-        "n_unparsed": n_unparsed, "n_total": n_total,
+        "overall": overall_acc,
+        "per_category": cat_accs,
+        "per_l2_category": l2_accs,
+        "n_unparsed": n_unparsed,
+        "n_total": n_total,
     }
 
 
 def print_comparison(metrics_dict):
-    """打印多个模型的对比表。"""
     labels = list(metrics_dict.keys())
     if len(labels) < 2:
         return
 
     print(f"\n{'='*70}")
-    print(f"  CV-Bench Comparison")
+    print(f"  MMStar Comparison")
     print(f"{'='*70}")
 
-    header = f"  {'Metric':<25s}"
+    header = f"  {'Metric':<35s}"
     for label in labels:
         header += f" {label:>12s}"
-    if len(labels) >= 2:
-        header += f" {'Delta':>8s}"
+    header += f" {'Delta':>8s}"
     print(header)
-    print(f"  {'─'*60}")
+    print(f"  {'─'*65}")
 
-    rows = [
-        ("CV-Bench Overall", "cv_bench"),
-        ("2D Accuracy", "acc_2d"),
-        ("  ADE20K", "acc_ade"),
-        ("  COCO", "acc_coco"),
-        ("3D Accuracy", "acc_3d"),
-        ("  Omni3D", "acc_omni"),
-    ]
-    for name, key in rows:
-        line = f"  {name:<25s}"
-        vals = [metrics_dict[l][key] for l in labels]
-        for v in vals:
-            line += f" {v:12.2f}"
-        if len(vals) >= 2:
-            d = vals[-1] - vals[0]
-            line += f" {'+'if d>0 else ''}{d:7.2f}"
-        print(line)
+    # Overall
+    line = f"  {'Overall':35s}"
+    vals = [metrics_dict[l]["overall"] for l in labels]
+    for v in vals:
+        line += f" {v:12.2f}"
+    d = vals[-1] - vals[0]
+    line += f" {'+'if d>0 else ''}{d:7.2f}"
+    print(line)
 
-    all_tasks = sorted(set(
-        t for m in metrics_dict.values() for t in m["per_task"]
+    # L1 categories
+    print(f"  {'─'*65}")
+    all_cats = sorted(set(
+        c for m in metrics_dict.values() for c in m["per_category"]
     ))
-    print(f"  {'─'*60}")
-    for t in all_tasks:
-        line = f"    {t:<23s}"
-        vals = [metrics_dict[l]["per_task"].get(t, 0) for l in labels]
+    for cat in all_cats:
+        line = f"    {cat:33s}"
+        vals = [metrics_dict[l]["per_category"].get(cat, 0) for l in labels]
         for v in vals:
             line += f" {v:12.2f}"
-        if len(vals) >= 2:
-            d = vals[-1] - vals[0]
-            line += f" {'+'if d>0 else ''}{d:7.2f}"
+        d = vals[-1] - vals[0]
+        line += f" {'+'if d>0 else ''}{d:7.2f}"
         print(line)
 
-    print(f"  {'─'*60}")
-    line = f"  {'Unparsed':<25s}"
+    # Unparsed
+    print(f"  {'─'*65}")
+    line = f"  {'Unparsed':35s}"
     for l in labels:
         line += f" {metrics_dict[l]['n_unparsed']:>12d}"
     print(line)
@@ -462,48 +410,34 @@ def print_comparison(metrics_dict):
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--mode", type=str, default="both",
-                        choices=["base", "enhanced", "spatial", "no_pcs",
+                        choices=["base", "enhanced", "no_pcs",
                                  "finetune_baseline", "both", "all"])
     parser.add_argument("--layer", type=int, default=CFG.vis_layer)
-    parser.add_argument("--predictor_ckpt", type=str, default="outputs/focus_ckpt_copy/predictor_best.pt")
-    parser.add_argument("--qwen_ckpt", type=str, default=None,
-                        help="For enhanced: Stage 2 weights. For finetune_baseline: ablation weights.")
-    parser.add_argument("--baseline_ckpt", type=str, default=None,
-                        help="Finetune baseline weights (used in --mode all)")
-    # ── spatial 专用参数 ──
-    parser.add_argument("--spatial_predictor_ckpt", type=str,
-                        default="outputs/focus_ckpt_spatial/predictor_best.pt",
-                        help="Spatial model (Model_v2) predictor weights")
-    parser.add_argument("--spatial_qwen_ckpt", type=str, default=None,
-                        help="Spatial model (Model_v2) LM weights")
-    # ── no_pcs 专用参数 ──
+    parser.add_argument("--predictor_ckpt", type=str,
+                        default="outputs/focus_ckpt/predictor_best.pt")
+    parser.add_argument("--qwen_ckpt", type=str, default=None)
+    parser.add_argument("--baseline_ckpt", type=str, default=None)
     parser.add_argument("--no_pcs_predictor_ckpt", type=str,
-                        default="outputs/ablation_no_pcs/predictor_best.pt",
-                        help="No-PCS ablation predictor weights")
-    parser.add_argument("--no_pcs_qwen_ckpt", type=str, default=None,
-                        help="No-PCS ablation LM weights")
-    parser.add_argument("--subset", type=str, default=None, choices=["2D", "3D"])
-    parser.add_argument("--save_dir", type=str, default="outputs/cvbench_results")
+                        default="outputs/ablation_no_pcs/predictor_best.pt")
+    parser.add_argument("--no_pcs_qwen_ckpt", type=str, default=None)
+    parser.add_argument("--save_dir", type=str, default="outputs/mmstar_results")
     parser.add_argument("--max_samples", type=int, default=None)
     args = parser.parse_args()
 
     os.makedirs(args.save_dir, exist_ok=True)
 
     # ── 加载数据集 ──
-    print("Loading CV-Bench...")
-    if args.subset:
-        ds = load_dataset("nyu-visionx/CV-Bench", args.subset, split="test")
-    else:
-        ds = load_dataset("nyu-visionx/CV-Bench", split="test")
+    print("Loading MMStar...")
+    ds = load_dataset("Lin-Chen/MMStar", split="val")
     if args.max_samples:
         ds = ds.select(range(min(args.max_samples, len(ds))))
     print(f"  Samples: {len(ds)}")
 
-    task_counts = defaultdict(int)
+    cat_counts = defaultdict(int)
     for item in ds:
-        task_counts[item["task"]] += 1
-    for t, c in sorted(task_counts.items()):
-        print(f"    {t}: {c}")
+        cat_counts[item["category"]] += 1
+    for c, n in sorted(cat_counts.items()):
+        print(f"    {c}: {n}")
 
     # ── 评估 ──
     all_metrics = {}
@@ -512,9 +446,7 @@ def main():
     run_ft_base  = args.mode in ["finetune_baseline", "all"]
     run_no_pcs   = args.mode in ["no_pcs", "all"]
     run_enhanced = args.mode in ["enhanced", "both", "all"]
-    run_spatial  = args.mode in ["spatial", "all"]
 
-    # 1. Base (vanilla Qwen)
     if run_base:
         base_model, processor = load_base_model()
         res = evaluate_base(
@@ -526,7 +458,6 @@ def main():
         del base_model, processor
         torch.cuda.empty_cache()
 
-    # 2. Finetune baseline (same data, no hooks)
     if run_ft_base:
         ft_ckpt = args.baseline_ckpt or args.qwen_ckpt
         ft_model, ft_processor = load_finetune_baseline(ft_ckpt)
@@ -535,11 +466,10 @@ def main():
             save_path=os.path.join(args.save_dir, "finetune_baseline_results.json"),
             label="finetune_baseline",
         )
-        all_metrics["finetune_baseline"] = compute_metrics(res, label="Finetune Baseline (no hooks)")
+        all_metrics["finetune_baseline"] = compute_metrics(res, label="Finetune Baseline")
         del ft_model, ft_processor
         torch.cuda.empty_cache()
 
-    # 3. No-PCS ablation
     if run_no_pcs:
         no_pcs_model = load_enhanced_model_no_pcs(args)
         res = evaluate_enhanced(
@@ -551,28 +481,15 @@ def main():
         del no_pcs_model
         torch.cuda.empty_cache()
 
-    # 4. Enhanced (v1: full architecture, no spatial)
     if run_enhanced:
         enhanced_model = load_enhanced_model(args)
         res = evaluate_enhanced(
             enhanced_model, ds,
-            save_path=os.path.join(args.save_dir, "enhanced_results_copy.json"),
-            label="enhanced (v1)",
+            save_path=os.path.join(args.save_dir, "enhanced_results.json"),
+            label="enhanced",
         )
-        all_metrics["enhanced"] = compute_metrics(res, label="Enhanced (v1)")
+        all_metrics["enhanced"] = compute_metrics(res, label="Enhanced")
         del enhanced_model
-        torch.cuda.empty_cache()
-
-    # 5. Spatial (v2: full architecture + SpatialPatchInteraction)
-    if run_spatial:
-        spatial_model = load_spatial_model(args)
-        res = evaluate_enhanced(
-            spatial_model, ds,
-            save_path=os.path.join(args.save_dir, "spatial_results.json"),
-            label="spatial (v2)",
-        )
-        all_metrics["spatial"] = compute_metrics(res, label="Spatial (v2)")
-        del spatial_model
         torch.cuda.empty_cache()
 
     # ── 对比 ──
@@ -580,9 +497,9 @@ def main():
         print_comparison(all_metrics)
 
     # ── 保存 ──
-    with open(os.path.join(args.save_dir, "summary_copy.json"), "w") as f:
+    with open(os.path.join(args.save_dir, "summary.json"), "w") as f:
         json.dump(all_metrics, f, indent=2)
-    print(f"\nDone. Summary saved to {args.save_dir}/summary_copy.json")
+    print(f"\nDone. Summary saved to {args.save_dir}/summary.json")
 
 
 if __name__ == "__main__":

@@ -143,7 +143,7 @@ class PrincipalComponentSuppressor(nn.Module):
         super().__init__()
         self.n_suppress = n_suppress
         # softplus(-3.0) ≈ 0.049，初始几乎不抑制
-        self.alpha_param = nn.Parameter(torch.tensor(-2.5))
+        self.alpha_param = nn.Parameter(torch.tensor(-3.00))
 
     def forward(self, vision_h):
         """
@@ -728,9 +728,9 @@ class QwenWithClusterPredictorAndSAE(nn.Module):
         return self.base_model(**kwargs)
 
     @classmethod
-    #目前最优抑制成分个数为3
+    #目前最优抑制成分个数为2
     def from_pretrained(cls, model_id, sae_ckpt_dir, cluster_path,
-                        inject_layer=8, suppress_layer=-8, n_suppress_pcs=3,
+                        inject_layer=8, suppress_layer=-8, n_suppress_pcs=2,
                         latent_mult=8, topk=32, top_n_patches=60,
                         top_k_clusters=10, cluster_threshold=0.5,
                         bce_lambda=0.5, align_lambda=0.3,

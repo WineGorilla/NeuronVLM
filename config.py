@@ -7,6 +7,7 @@ import torch
 class Config:
     # 模型
     model_id: str = "Qwen/Qwen2.5-VL-7B-Instruct"
+    llava_model_id = "llava-hf/llava-onevision-qwen2-7b-ov-hf"
 
     # 数据
     train_file: str = "data/train_vqa2.jsonl"
@@ -29,8 +30,11 @@ class Config:
 
 
     # ── 路径 ──────────────────────────────────────────────────
-    save_dir: str = "outputs/sae_ckpt"
-    cache_dir: str = "outputs"
+    save_llava_dir: str = "outputs/llava/sae_ckpt"
+    save_dir: str = "outputs/qwen/sae_ckpt"
+
+    llava_cache_dir: str = "outputs/llava"
+    cache_dir: str = "outputs/qwen"
     label_dir: str = "assets"
 
     # ── 推理 / 可视化 
