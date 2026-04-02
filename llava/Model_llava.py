@@ -144,11 +144,13 @@ class SemanticCompleter(nn.Module):
 def _find_layers(model):
     """
     LLaVA-OneVision 的 layers 路径：
-      model.language_model.model.layers  (最常见)
+      model.model.language_model.layers  (实测 llava-onevision-qwen2-7b-ov-hf)
+      model.language_model.model.layers  (某些版本)
       model.model.layers                 (某些封装方式)
     """
     for path in [
-        lambda m: m.language_model.model.layers,    # LlavaOnevisionForConditionalGeneration
+        lambda m: m.model.language_model.layers,
+        lambda m: m.language_model.model.layers,
         lambda m: m.model.language_model.model.layers,
         lambda m: m.model.layers,
     ]:
@@ -377,7 +379,12 @@ class LlavaOVWithClusterPredictorAndSAE(nn.Module):
         if self._hook_fired:
             return output
 
-        hs = output[0]
+        # LLaVA-OV layer 输出可能是 Tensor (seq, dim) 或 tuple
+        is_tuple = isinstance(output, tuple)
+        hs = output[0] if is_tuple else output
+        if hs.dim() == 2:
+            hs = hs.unsqueeze(0)  # (seq, dim) -> (1, seq, dim)
+
         if hs.shape[1] <= 1:
             return output
 
@@ -418,13 +425,21 @@ class LlavaOVWithClusterPredictorAndSAE(nn.Module):
         updated = self.semantic_cross_attn(vision_active, recon_projected)
         hs_mod[0, v_pos + active_indices, :] = updated.to(hs.dtype)
 
-        return (hs_mod,) + output[1:]
+        # 返回时保持原始格式
+        if hs_mod.shape[0] == 1 and not is_tuple:
+            return hs_mod.squeeze(0)  # 还原为 (seq, dim)
+        return (hs_mod,) + output[1:] if is_tuple else hs_mod.squeeze(0)
 
     def _suppress_hook(self, module, input, output):
         if self._suppress_hook_fired:
             return output
 
-        hs = output[0]
+        # LLaVA-OV layer 输出可能是 Tensor (seq, dim) 或 tuple
+        is_tuple = isinstance(output, tuple)
+        hs = output[0] if is_tuple else output
+        if hs.dim() == 2:
+            hs = hs.unsqueeze(0)
+
         if hs.shape[1] <= 1:
             return output
 
@@ -436,7 +451,9 @@ class LlavaOVWithClusterPredictorAndSAE(nn.Module):
         suppressed = self.pc_suppressor(vision_h)
         hs_mod[0, v_pos:v_pos + n_img, :] = suppressed.to(hs.dtype)
 
-        return (hs_mod,) + output[1:]
+        if hs_mod.shape[0] == 1 and not is_tuple:
+            return hs_mod.squeeze(0)
+        return (hs_mod,) + output[1:] if is_tuple else hs_mod.squeeze(0)
 
     # ── Hook 生命周期管理（与 Qwen 版相同）────────────────────────────────────
 

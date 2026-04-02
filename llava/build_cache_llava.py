@@ -5,6 +5,8 @@ SAE latent 缓存构建 — LLaVA-OneVision 版。
 只构建 SAE latent 缓存，不做标注。
 使用数据集中的真实问题构建 prompt，与训练时保持一致。
 
+优化：用 hook 提取目标层后提前终止 forward，省掉后续层的计算。
+
 用法：
     python llava/build_cache_llava.py --layer 8
     python llava/build_cache_llava.py --all
@@ -49,16 +51,23 @@ def load_sae_model(layer: int):
     return processor, model, sae
 
 
-def forward_single(image_path: str, question: str, layer: int, processor, model, sae):
-    """
-    LLaVA-OV 版本的单图前向。
+def _find_layers(model):
+    for path_fn in [
+        lambda m: m.model.language_model.layers,
+        lambda m: m.language_model.model.layers,
+        lambda m: m.model.language_model.model.layers,
+        lambda m: m.model.layers,
+    ]:
+        try:
+            layers = path_fn(model)
+            if hasattr(layers, '__len__') and len(layers) > 0:
+                return layers
+        except AttributeError:
+            pass
+    raise AttributeError("Cannot find transformer layers")
 
-    与 Qwen 版的区别：
-      - 用 PIL Image 加载图片
-      - conversation 格式：{"type": "image"} 而非 {"type": "image", "image": path}
-      - vision token 定位：找 image_token_index 而非 <|vision_start|>
-      - 无需 process_vision_info()
-    """
+
+def forward_single(image_path: str, question: str, layer: int, processor, model, sae, lm_layers):
     image = Image.open(image_path).convert("RGB")
 
     conversation = [{
@@ -77,12 +86,28 @@ def forward_single(image_path: str, question: str, layer: int, processor, model,
         return_tensors="pt",
     ).to(CFG.device)
 
-    with torch.no_grad():
-        outputs = model(**inputs, output_hidden_states=True, return_dict=True)
+    # ── 用 hook 提取目标层，提前终止 forward ──────────────────
+    captured = {}
 
-    h = outputs.hidden_states[layer + 1]
+    def hook_fn(module, input, output):
+        # LLaVA-OV layer 输出是 Tensor (seq, dim)，不是 tuple
+        h = output[0] if isinstance(output, tuple) else output
+        if h.dim() == 2:
+            h = h.unsqueeze(0)  # (seq, dim) -> (1, seq, dim)
+        captured["hidden"] = h.detach()
+        raise StopIteration
 
-    # ── vision token 定位 ─────────────────────────────────────
+    handle = lm_layers[layer].register_forward_hook(hook_fn)
+    try:
+        with torch.no_grad():
+            model(**inputs)
+    except StopIteration:
+        pass
+    finally:
+        handle.remove()
+
+    h = captured["hidden"]  # (1, seq, dim)
+
     input_ids = inputs["input_ids"][0]
     image_token_id = getattr(
         model.config, "image_token_index",
@@ -93,15 +118,11 @@ def forward_single(image_path: str, question: str, layer: int, processor, model,
     if len(vision_indices) == 0:
         raise ValueError("No vision tokens found")
 
-    img_tokens = h[0, vision_indices, :]  # (num_vision, hidden_dim)
+    img_tokens = h[0, vision_indices, :]
     flat = img_tokens.float()
 
-    # ── 计算 H_tok, W_tok 用于后续可视化 ─────────────────────
-    # LLaVA-OV 的 vision token 数量取决于图片分辨率和 anyres 策略
-    # 这里用 sqrt 近似，如果有 image_sizes 可以更精确
     n_tokens = len(vision_indices)
     H_tok = W_tok = int(n_tokens ** 0.5)
-    # 尝试从 image_sizes 推算更精确的 H/W
     if "image_sizes" in inputs:
         img_sizes = inputs["image_sizes"]
         if img_sizes is not None and len(img_sizes) > 0:
@@ -118,7 +139,7 @@ def forward_single(image_path: str, question: str, layer: int, processor, model,
 
 
 def build_cache(layer: int):
-    cache_path = os.path.join(CFG.cache_dir, f"cache_layer{layer}.pkl")
+    cache_path = os.path.join(CFG.llava_cache_dir, f"cache_layer{layer}.pkl")
 
     if os.path.exists(cache_path):
         print(f"[layer {layer}] cache already exists: {cache_path}, skipping.")
@@ -126,16 +147,23 @@ def build_cache(layer: int):
 
     print(f"[layer {layer}] loading model & SAE...")
     processor, model, sae = load_sae_model(layer)
+    lm_layers = _find_layers(model)
+    print(f"[layer {layer}] found {len(lm_layers)} transformer layers, early stop at layer {layer}")
 
     samples = []
     with open(CFG.train_file) as f:
         for line in f:
             samples.append(json.loads(line))
 
-    print(f"[layer {layer}] caching {len(samples)} images...")
+    unique_images = set(s["image"] for s in samples)
+    print(f"[layer {layer}] total samples: {len(samples)}, unique images: {len(unique_images)}")
+
     cache = []
     seen_images = set()
     for i, sample in enumerate(samples):
+        if (i + 1) % 500 == 0:
+            print(f"  [{i+1}/{len(samples)}] unique={len(seen_images)}, cached={len(cache)}")
+
         image_path = sample["image"]
 
         if image_path in seen_images:
@@ -144,12 +172,9 @@ def build_cache(layer: int):
 
         question = sample.get("question") or "Describe the image."
 
-        if (i + 1) % 500 == 0:
-            print(f"  [{i+1}/{len(samples)}] unique={len(seen_images)}")
-
         try:
             z_sparse, H_tok, W_tok = forward_single(
-                image_path, question, layer, processor, model, sae
+                image_path, question, layer, processor, model, sae, lm_layers
             )
             cache.append({
                 "image_path": image_path,
@@ -160,6 +185,8 @@ def build_cache(layer: int):
             })
         except Exception as e:
             print(f"  [skip] {image_path}: {e}")
+
+    print(f"[layer {layer}] total samples: {len(samples)}, unique images: {len(seen_images)}, cached: {len(cache)}")
 
     with open(cache_path, "wb") as f:
         pickle.dump(cache, f)
@@ -176,7 +203,7 @@ def main():
     group.add_argument("--all",   action="store_true", help="构建所有层缓存")
     args = parser.parse_args()
 
-    os.makedirs(CFG.cache_dir, exist_ok=True)
+    os.makedirs(CFG.llava_cache_dir, exist_ok=True)
 
     layers = CFG.layers if args.all else [args.layer]
     for layer in layers:
@@ -184,9 +211,9 @@ def main():
 
     print("\nAll done. Next steps:")
     for layer in layers:
-        print(f"  python scripts/build_feature_index.py --layer {layer}")
+        print(f"  python llava/build_feature_index_llava.py --layer {layer}")
     for layer in layers:
-        print(f"  python scripts/interpret.py --layer {layer}")
+        print(f"  python llava/interpret_llava.py --layer {layer}")
 
 
 if __name__ == "__main__":

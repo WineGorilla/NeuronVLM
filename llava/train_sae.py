@@ -22,17 +22,21 @@ from llava.dataset_llava import VisionTextDataset, build_collate
 transformers.logging.set_verbosity_error()
 
 
+class UniqueImageDataset(VisionTextDataset):
+    """只保留每张图片的第一个 sample，去重。"""
+    def __init__(self, path: str):
+        super().__init__(path)
+        seen = set()
+        deduped = []
+        for s in self.samples:
+            if s["image"] not in seen:
+                seen.add(s["image"])
+                deduped.append(s)
+        print(f"  Dataset dedup: {len(self.samples)} samples -> {len(deduped)} unique images")
+        self.samples = deduped
+
+
 def _find_vision_token_range(input_ids, image_token_id):
-    """
-    找到 input_ids 中连续 image tokens 的起始位置和数量。
-
-    LLaVA-OV 和 Qwen2.5-VL 的关键区别：
-      - Qwen:    <|vision_start|> [vision tokens] <|vision_end|>
-      - LLaVA-OV: 连续的 image_token_id（默认 151646）
-
-    Returns:
-        (v_pos, n_img) — vision tokens 的起始索引和数量
-    """
     image_mask = (input_ids == image_token_id)
     image_positions = image_mask.nonzero(as_tuple=False).squeeze(-1)
 
@@ -74,7 +78,7 @@ def train():
     sae_params = [p for sae in saes.values() for p in sae.parameters()]
     optimizer  = torch.optim.AdamW(sae_params, lr=CFG.lr)
 
-    dataset = VisionTextDataset(CFG.train_file)
+    dataset = UniqueImageDataset(CFG.train_file)
     loader  = DataLoader(
         dataset,
         batch_size = CFG.batch_size,
@@ -82,18 +86,16 @@ def train():
         collate_fn = build_collate(processor),
     )
 
-    # ── LLaVA-OV 的 image token ID ───────────────────────────
     image_token_id = getattr(
         model.config, "image_token_index",
         processor.tokenizer.convert_tokens_to_ids("<image>"),
     )
     save_every = getattr(CFG, "save_every", 5000)
 
-    print(f"Dataset size       : {len(dataset)}")
+    print(f"Dataset size       : {len(dataset)} (unique images)")
     print(f"Image token ID     : {image_token_id}")
     print(f"Save every         : {save_every} steps")
 
-    # ── 保存函数 ───────────────────────────────────────────────
     def save_checkpoints(tag="latest"):
         for l in CFG.layers:
             path = os.path.join(CFG.save_llava_dir, f"sae_layer{l}_{tag}.pt")
@@ -102,7 +104,6 @@ def train():
             latest_path = os.path.join(CFG.save_llava_dir, f"sae_layer{l}.pt")
             torch.save(saes[l].state_dict(), latest_path)
 
-    # ── Ctrl+C 自动保存 ────────────────────────────────────────
     def handle_sigint(sig, frame):
         print("\n[interrupted] saving checkpoints before exit...")
         save_checkpoints("interrupted")
@@ -110,10 +111,9 @@ def train():
 
     signal.signal(signal.SIGINT, handle_sigint)
 
-    # ── 训练循环 ───────────────────────────────────────────────
     optimizer_step = 0
 
-    for epoch in range(CFG.epochs):
+    for epoch in range(CFG.sae_epochs):
         print(f"\nEpoch {epoch}")
 
         for step, batch in enumerate(loader):
@@ -122,7 +122,6 @@ def train():
                 for k, v in batch.items()
             }
 
-            # ── 前向：提取 hidden states ──────────────────────
             with torch.no_grad():
                 outputs = model(
                     **{k: v for k, v in batch.items() if torch.is_tensor(v)},
@@ -130,7 +129,6 @@ def train():
                     return_dict=True,
                 )
 
-            # ── 找到 vision token 位置 ────────────────────────
             input_ids = batch["input_ids"][0]
             v_pos, n_img = _find_vision_token_range(input_ids, image_token_id)
 

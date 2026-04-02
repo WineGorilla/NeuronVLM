@@ -10,6 +10,7 @@ class Config:
     llava_model_id = "llava-hf/llava-onevision-qwen2-7b-ov-hf"
 
     # 数据
+
     train_file: str = "data/train_vqa2.jsonl"
 
     # ── SAE 层索引（内部会 +1 以跳过 embedding 层）──────────────
@@ -21,6 +22,7 @@ class Config:
 
     # ── 训练超参 ──────────────────────────────────────────────
     batch_size:    int   = 1
+    sae_epochs:    int   = 1
     epochs:        int   = 2
     lr:            float = 1e-4   # 归一化去掉后可以稍大
     sparsity_coef: float = 0.05

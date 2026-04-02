@@ -10,17 +10,31 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(__file__)))
 import torch
 import torch.nn.functional as F
 from torch.utils.data import DataLoader
-from transformers import AutoProcessor, Qwen2_5_VLForConditionalGeneration
 
 from config import CFG
 from src.SAE import SAE
 from src.dataset import VisionTextDataset, build_collate
 
 
+class UniqueImageDataset(VisionTextDataset):
+    """只保留每张图片的第一个 sample，去重。"""
+    def __init__(self, path: str):
+        super().__init__(path)
+        seen = set()
+        deduped = []
+        for s in self.samples:
+            if s["image"] not in seen:
+                seen.add(s["image"])
+                deduped.append(s)
+        print(f"  Dataset dedup: {len(self.samples)} samples -> {len(deduped)} unique images")
+        self.samples = deduped
+
+
 def train():
     os.makedirs(CFG.save_dir, exist_ok=True)
 
     print("Loading model:", CFG.model_id)
+    from transformers import AutoProcessor, Qwen2_5_VLForConditionalGeneration
     processor = AutoProcessor.from_pretrained(CFG.model_id)
     model = Qwen2_5_VLForConditionalGeneration.from_pretrained(
         CFG.model_id,
@@ -43,7 +57,7 @@ def train():
 
     optimizer  = torch.optim.AdamW(sae_params, lr=CFG.lr)
 
-    dataset = VisionTextDataset(CFG.train_file)
+    dataset = UniqueImageDataset(CFG.train_file)
     loader  = DataLoader(
         dataset,
         batch_size = CFG.batch_size,
@@ -55,7 +69,7 @@ def train():
     vision_start_id = processor.tokenizer.convert_tokens_to_ids("<|vision_start|>")
     save_every      = getattr(CFG, "save_every", 5000)
 
-    print(f"Dataset size       : {len(dataset)}")
+    print(f"Dataset size       : {len(dataset)} (unique images)")
     print(f"Save every         : {save_every} steps")
 
     # ── 保存函数 ───────────────────────────────────────────────
@@ -64,7 +78,6 @@ def train():
             path = os.path.join(CFG.save_dir, f"sae_layer{l}_{tag}.pt")
             torch.save(saes[l].state_dict(), path)
             print(f"  saved {path}")
-            # 同时覆盖保存 latest
             latest_path = os.path.join(CFG.save_dir, f"sae_layer{l}.pt")
             torch.save(saes[l].state_dict(), latest_path)
 
@@ -79,7 +92,7 @@ def train():
     # ── 训练循环 ───────────────────────────────────────────────
     optimizer_step = 0
 
-    for epoch in range(CFG.epochs):
+    for epoch in range(CFG.sae_epochs):
         print(f"\nEpoch {epoch}")
 
         for step, batch in enumerate(loader):
