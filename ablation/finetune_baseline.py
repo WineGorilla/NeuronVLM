@@ -15,7 +15,7 @@ Ablation Baseline: 纯 finetune，无架构改动
 
 用法：
   python -m ablation.finetune_baseline \
-      --data data/train.jsonl \
+      --data data/train_cluster.jsonl \
       --output_dir outputs/ablation_baseline
 """
 import os

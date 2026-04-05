@@ -24,7 +24,7 @@
     }
 
 用法：
-    python scripts/cluster_features.py --layer 8 --n_clusters 32
+    python scripts/cluster_features.py --layer 8 --n_clusters 128
 """
 import os
 import sys
@@ -101,7 +101,7 @@ def name_cluster_with_claude(cluster_labels: list, cluster_id: int) -> str:
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--layer",      type=int, default=CFG.vis_layer)
-    parser.add_argument("--n_clusters", type=int, default=32,
+    parser.add_argument("--n_clusters", type=int, default=128,
                         help="聚类数量")
     parser.add_argument("--encoder",    type=str,
                         default="all-MiniLM-L6-v2",

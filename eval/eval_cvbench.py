@@ -3,7 +3,7 @@ CV-Bench 评估脚本。
 
 用法：
     python eval/eval_cvbench.py --mode base
-    python eval/eval_cvbench.py --mode enhanced
+    CUDA_VISIBLE_DEVICES=1 python eval/eval_cvbench.py --mode enhanced
     python eval/eval_cvbench.py --mode spatial --qwen_ckpt outputs/focus_v2_ckpt/qwen_best.pt
     python eval/eval_cvbench.py --mode finetune_baseline --qwen_ckpt outputs/ablation_baseline/qwen_best.pt
     python eval/eval_cvbench.py --mode no_pcs --no_pcs_qwen_ckpt outputs/ablation_no_pcs/qwen_best.pt
@@ -465,7 +465,7 @@ def main():
                         choices=["base", "enhanced", "spatial", "no_pcs",
                                  "finetune_baseline", "both", "all"])
     parser.add_argument("--layer", type=int, default=CFG.vis_layer)
-    parser.add_argument("--predictor_ckpt", type=str, default="outputs/focus_ckpt/predictor_best.pt")
+    parser.add_argument("--predictor_ckpt", type=str, default="outputs/focus_ckpt_0.75_64_5000/predictor_best.pt")
     parser.add_argument("--qwen_ckpt", type=str, default=None,
                         help="For enhanced: Stage 2 weights. For finetune_baseline: ablation weights.")
     parser.add_argument("--baseline_ckpt", type=str, default=None,

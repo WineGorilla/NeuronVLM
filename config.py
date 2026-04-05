@@ -42,8 +42,8 @@ class Config:
     # ── 推理 / 可视化 
     vis_layer: int = 8           # 可视化时使用的层
     vis_feature_id: int = 120    # 默认查看的 feature id
-    top_n_patches: int = 60      # 每张图保留激活最强的 patch 数
-    top_n_images: int = 5        # 每个 feature 展示的 top-N 图片数
+    top_n_patches: int = 60      # 每张图保留激活最强的 patch 数 注意llava和qwen是不一样个数的 qwen60 llava480 4倍
+    top_n_images: int = 5        # 每个 feature 展示的 top-N 图片数 注意
 
     # ── 设备 ──────────────────────────────────────────────────
     device: str = "cuda" if torch.cuda.is_available() else "cpu"

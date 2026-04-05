@@ -414,7 +414,7 @@ def main():
                                  "finetune_baseline", "both", "all"])
     parser.add_argument("--layer", type=int, default=CFG.vis_layer)
     parser.add_argument("--predictor_ckpt", type=str,
-                        default="outputs/focus_ckpt/predictor_best.pt")
+                        default="outputs/focus_ckpt_0.75_64_5000/predictor_best.pt")
     parser.add_argument("--qwen_ckpt", type=str, default=None)
     parser.add_argument("--baseline_ckpt", type=str, default=None)
     parser.add_argument("--no_pcs_predictor_ckpt", type=str,

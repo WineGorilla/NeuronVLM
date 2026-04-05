@@ -3,7 +3,7 @@
 
 用法：
     python scripts/build_feature_index.py --layer 8
-    python scripts/interpret.py --layer 8
+    python scripts/interpreta.py --layer 8
     python scripts/interpret.py --layer 8 --debug_feature 100
 """
 import os
@@ -46,7 +46,6 @@ def load_annotator():
 
 
 # ── 从 feature_index 生成 masked 图 ──────────────────────────────────────────
-
 def make_masked_from_index(entry: tuple) -> dict:
     score, image_path, H_tok, W_tok, top_patch_idx = entry
 
@@ -55,17 +54,17 @@ def make_masked_from_index(entry: tuple) -> dict:
         return None
 
     orig_h, orig_w = img.shape[:2]
-    masked  = np.zeros_like(img)
-    block_w = int(orig_w / W_tok)
-    block_h = int(orig_h / H_tok)
+    masked = np.zeros_like(img)
 
     for idx in top_patch_idx:
         tok_y = idx // W_tok
         tok_x = idx %  W_tok
-        px_x  = int(tok_x / W_tok * orig_w)
-        px_y  = int(tok_y / H_tok * orig_h)
-        masked[px_y : px_y + block_h, px_x : px_x + block_w] = \
-            img[px_y : px_y + block_h, px_x : px_x + block_w]
+        # 用相邻 patch 起点作为当前 patch 终点，消除间隙
+        x0 = int(tok_x       / W_tok * orig_w)
+        x1 = int((tok_x + 1) / W_tok * orig_w)
+        y0 = int(tok_y       / H_tok * orig_h)
+        y1 = int((tok_y + 1) / H_tok * orig_h)
+        masked[y0:y1, x0:x1] = img[y0:y1, x0:x1]
 
     return {
         "image_path":  image_path,
@@ -212,7 +211,7 @@ def main():
     os.makedirs(CFG.cache_dir,  exist_ok=True)
     os.makedirs(PREVIEW_DIR,    exist_ok=True)
 
-    index_path = os.path.join(CFG.cache_dir, f"feature_index_layer{args.layer}_3.pkl")
+    index_path = os.path.join(CFG.cache_dir, f"feature_index/feature_index_layer{args.layer}_5.pkl")
     if not os.path.exists(index_path):
         print(f"Feature index not found: {index_path}")
         print(f"Please run: python scripts/build_feature_index.py --layer {args.layer}")

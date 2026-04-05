@@ -115,11 +115,11 @@ python scripts/inference.py \
 
 
 # 调参专用
-python -m src.train_focus --stage 1 && python -m src.train_focus --stage 2 --resume best && python eval/eval_cvbench.py --mode enhanced
+python scripts/build_cluster_data.py --layer 8 --max 5000 && python -m src.train_focus --stage 1 && python -m src.train_focus --stage 2 --resume best && python eval/eval_cvbench.py --mode enhanced
 python eval/eval_cvbench.py --mode enhanced --qwen_ckpt outputs/focus_ckpt/qwen_best.pt
 
 
-CUDA_VISIBLE_DEVICES=1 python eval/eval_cvbench_copy.py --mode enhanced --qwen_ckpt outputs/focus_ckpt_0.75_best/qwen_best.pt
+CUDA_VISIBLE_DEVICES=1 python eval/eval_cvbench_copy.py --mode enhanced --qwen_ckpt outputs/focus_ckpt/qwen_best.pt
 
 
 CUDA_VISIBLE_DEVICES=1 python -m src.train_focus_copy --stage 1 && python -m src.train_focus_copy --stage 2 --resume best && python eval/eval_cvbench_copy.py --mode enhanced
@@ -132,3 +132,8 @@ CUDA_VISIBLE_DEVICES=1 python eval/eval_mmstar.py --mode enhanced
 
 
 CUDA_VISIBLE_DEVICES=1 python eval/eval_cvbench.py --mode enhanced --qwen_ckpt outputs/focus_ckpt/qwen_best.pt
+
+
+
+CUDA_VISIBLE_DEVICES=0 python -m src.train && python scripts/build_cache.py --layer 8 && python scripts/build_feature_index.py --layer 8
+CUDA_VISIBLE_DEVICES=1 python -m llava.train_sae && python llava/build_cache_llava.py --layer 8

@@ -41,7 +41,7 @@ def main():
     parser.add_argument("--layer",      type=int, default=CFG.vis_layer)
     parser.add_argument("--top_k",      type=int, default=10,
                         help="每个 feature 保留激活最强的 top-K 张图")
-    parser.add_argument("--min_images", type=int, default=5,
+    parser.add_argument("--min_images", type=int, default=3,
                         help="每个 feature 至少需要 N 张不同图片才保留")
     args = parser.parse_args()
 

@@ -730,7 +730,7 @@ class QwenWithClusterPredictorAndSAE(nn.Module):
     @classmethod
     #目前最优抑制成分个数为3
     def from_pretrained(cls, model_id, sae_ckpt_dir, cluster_path,
-                        inject_layer=8, suppress_layer=-8, n_suppress_pcs=2,
+                        inject_layer=8, suppress_layer=-8, n_suppress_pcs=3,
                         latent_mult=8, topk=32, top_n_patches=60,
                         top_k_clusters=10, cluster_threshold=0.5,
                         bce_lambda=0.5, align_lambda=0.3,
