@@ -1,17 +1,17 @@
 """
-两阶段训练 — LLaVA-OneVision 版
+两阶段训练 — LLaVA-NeXT-LLaMA3 版
 
 Stage 1: 学 what to focus
   - 训练 ClusterPredictor + ImageClusterScorer
   - Hook 只读：预测 cluster，不修改 hidden
   - Loss = BCE + alignment
-  - 命令: python -m llava.train_focus_llava --stage 1 && python -m llava.train_focus_llava --stage 2 --resume best
+  - 命令: python -m llava_next.train_focus_llava_next --stage 1
 
 Stage 2: 学 how to inject
   - 训练 SemanticCrossAttention + ExtraProjector + top LM layers
   - Hook 读写：预测 cluster + 注入 extra tokens
   - Loss = LM + BCE + alignment
-  - 命令: python -m llava.train_focus_llava --stage 2 --resume best
+  - 命令: python -m llava_next.train_focus_llava_next --stage 2 --resume best
 """
 import os
 import sys
@@ -24,7 +24,7 @@ import torch
 import torch.nn.functional as F
 
 from config import CFG
-from llava.Model_llava import LlavaOVWithClusterPredictorAndSAE
+from llava_next.Model_llava_next import LlavaNextWithClusterPredictorAndSAE
 from src.dataset import VisionTextDataset
 
 
@@ -37,7 +37,7 @@ EPOCHS         = 3
 GRAD_ACCUM     = 8
 LOG_EVERY      = 10
 SAVE_EVERY     = 500
-SAVE_DIR       = "outputs/llava_focus_ckpt"
+SAVE_DIR       = "outputs/llava_next_focus_ckpt"
 
 
 def main():
@@ -51,15 +51,23 @@ def main():
 
     os.makedirs(SAVE_DIR, exist_ok=True)
 
+    # ── 路径配置 ──────────────────────────────────────────────────────────────
+    # 需要在 config.py 中添加：
+    #   llava_next_model_id = "llava-hf/llama3-llava-next-8b-hf"
+    #   save_llava_next_dir = "outputs/sae_llava_next"
+    # 如果还没加，这里提供 fallback
+    model_id     = getattr(CFG, "llava_next_model_id", "llava-hf/llama3-llava-next-8b-hf")
+    sae_ckpt_dir = getattr(CFG, "save_llava_next_dir", "outputs/sae_llava_next")
+
     cluster_path   = os.path.join(CFG.label_dir, f"feature_clusters_layer{CFG.vis_layer}.json")
     predictor_ckpt = (
         os.path.join(SAVE_DIR, f"predictor_{args.resume}.pt")
         if args.resume else None
     )
 
-    model = LlavaOVWithClusterPredictorAndSAE.from_pretrained(
-        model_id          = CFG.llava_model_id,
-        sae_ckpt_dir      = CFG.save_dir,
+    model = LlavaNextWithClusterPredictorAndSAE.from_pretrained(
+        model_id          = model_id,
+        sae_ckpt_dir      = sae_ckpt_dir,
         cluster_path      = cluster_path,
         inject_layer      = CFG.vis_layer,
         latent_mult       = CFG.latent_mult,
@@ -74,9 +82,8 @@ def main():
 
     dataset = VisionTextDataset(args.data)
 
-    # ── 找到 LLaVA-OV 的 LM layers ───────────────────────────────────────────
-    # LLaVA-OV: base_model.language_model.model.layers
-    lm_layers = model._layers  # _find_layers 已经找好了
+    # ── 找到 LM layers ───────────────────────────────────────────────────────
+    lm_layers = model._layers
 
     # ── 配置 requires_grad + optimizer ────────────────────────────────────────
 
@@ -116,7 +123,6 @@ def main():
             p.requires_grad = False
 
         # ── 解冻 top-8 LM layers + lm_head ───────────────────────────────────
-        # LLaVA-OV 的 lm_head 路径：base_model.language_model.lm_head
         n_layers = len(lm_layers)
         trainable_layer_ids = list(range(n_layers - 8, n_layers))
         for i in trainable_layer_ids:
@@ -196,9 +202,8 @@ def main():
         model.save_predictor(pred_path)
 
         if args.stage == 2:
-            qwen_path = os.path.join(SAVE_DIR, f"llava_{tag}.pt")
+            lm_path = os.path.join(SAVE_DIR, f"llava_next_{tag}.pt")
             state = {}
-            # 保存解冻的 LM layers
             for k, v in model.base_model.state_dict().items():
                 for i in trainable_layer_ids:
                     if f".layers.{i}." in k:
@@ -206,8 +211,8 @@ def main():
                         break
                 if "lm_head." in k:
                     state[k] = v
-            torch.save(state, qwen_path)
-            print(f"  Saved LM layers: {qwen_path}")
+            torch.save(state, lm_path)
+            print(f"  Saved LM layers: {lm_path}")
 
     def handle_sigint(sig, frame):
         print("\n[interrupted] saving...")

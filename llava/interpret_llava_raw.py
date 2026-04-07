@@ -1,10 +1,13 @@
 """
-批量 SAE feature 语义标注流程 — LLaVA-OneVision 版。
+批量 SAE feature 语义标注流程 — LLaVA-OneVision 版（原图版）。
+
+与 mask 版的区别：直接用原图送给标注模型，不做 patch masking。
+标注模型看到完整图片，结合 "这些图片共同激活了同一个 feature" 的信息来推断语义。
 
 用法：
     python llava/build_feature_index_llava.py --layer 8
-    python llava/interpret_llava.py --layer 8
-    python llava/interpret_llava.py --layer 8 --debug_feature 100
+    python llava/interpret_llava_raw.py --layer 8
+    python llava/interpret_llava_raw.py --layer 8 --debug_feature 100
 """
 import os
 import sys
@@ -27,7 +30,7 @@ from config import CFG
 
 ANNOTATOR_MODEL_ID = "Qwen/Qwen2.5-VL-7B-Instruct"
 TOP_N_IMAGES       = 3
-PREVIEW_DIR        = "newoutputs/llava_feature_previews"
+PREVIEW_DIR        = "newoutputs/llava_feature_previews_raw"
 
 
 def load_annotator():
@@ -43,40 +46,29 @@ def load_annotator():
     return processor, model
 
 
-def make_masked_from_index(entry: tuple) -> dict:
+def load_original_image(entry: tuple) -> dict:
+    """直接加载原图，不做 mask。"""
     score, image_path, H_tok, W_tok, top_patch_idx = entry
 
     img = cv2.imread(image_path)
     if img is None:
         return None
 
-    orig_h, orig_w = img.shape[:2]
-    masked = np.zeros_like(img)
-
-    for idx in top_patch_idx:
-        tok_y = idx // W_tok
-        tok_x = idx %  W_tok
-        # 用相邻 patch 起点作为当前 patch 终点，消除间隙
-        x0 = int(tok_x       / W_tok * orig_w)
-        x1 = int((tok_x + 1) / W_tok * orig_w)
-        y0 = int(tok_y       / H_tok * orig_h)
-        y1 = int((tok_y + 1) / H_tok * orig_h)
-        masked[y0:y1, x0:x1] = img[y0:y1, x0:x1]
-
     return {
         "image_path":  image_path,
-        "masked_img":  masked,
+        "image":       img,
         "image_score": score,
     }
 
 
 def save_concat_image(top_results: list, feature_id: int, layer: int, label: str = ""):
+    """拼接原图保存预览。"""
     os.makedirs(PREVIEW_DIR, exist_ok=True)
 
     target_h    = 400
     concat_imgs = []
     for res in top_results:
-        img     = res["masked_img"]
+        img     = res["image"]
         scale   = target_h / img.shape[0]
         resized = cv2.resize(img, (int(img.shape[1] * scale), target_h))
         bordered = cv2.copyMakeBorder(
@@ -99,19 +91,20 @@ def save_concat_image(top_results: list, feature_id: int, layer: int, label: str
 def interpret_feature_with_qwen(
     top_results, feature_id, layer, ann_processor, ann_model,
 ) -> str:
+    """用原图让标注模型推断 feature 语义。"""
     tmp_paths = []
     for res in top_results:
         tmp = tempfile.NamedTemporaryFile(suffix=".png", delete=False)
-        cv2.imwrite(tmp.name, res["masked_img"])
+        cv2.imwrite(tmp.name, res["image"])
         tmp_paths.append(tmp.name)
 
     prompt = (
-        f"These are {len(tmp_paths)} images showing the regions most strongly activating "
-        f"SAE feature {feature_id} (layer {layer}) of a vision-language model. "
-        "In each image, only the patches with the strongest activation are visible; "
-        "the rest are blacked out. "
-        "Based on the visible regions across all images, "
-        "what visual concept or semantic pattern does this feature likely represent? "
+        f"These {len(tmp_paths)} images all strongly activate the same internal feature "
+        f"(feature {feature_id}, layer {layer}) of a vision-language model. "
+        "Please look at what these images have in common — it could be a shared object, "
+        "texture, color, scene type, spatial layout, or any other visual pattern. "
+        "Based on the common visual element across all images, "
+        "what concept or pattern does this feature likely detect? "
         "Please give a concise label of 1-5 words only, no explanation."
     )
 
@@ -161,6 +154,7 @@ def interpret_feature_with_qwen(
 
 
 def visualize_feature(feature_id: int, top_results: list, layer: int):
+    """调试用：显示某个 feature 激活最强的原图。"""
     n = len(top_results)
     if n == 0:
         print(f"No positive activation found for feature {feature_id}")
@@ -170,13 +164,13 @@ def visualize_feature(feature_id: int, top_results: list, layer: int):
     if n == 1:
         axes = [axes]
     for i, res in enumerate(top_results):
-        axes[i].imshow(cv2.cvtColor(res["masked_img"], cv2.COLOR_BGR2RGB))
+        axes[i].imshow(cv2.cvtColor(res["image"], cv2.COLOR_BGR2RGB))
         axes[i].axis("off")
         axes[i].set_title(
             f"{os.path.basename(res['image_path'])}\nscore={res['image_score']:.3f}",
             fontsize=9,
         )
-    plt.suptitle(f"Feature {feature_id} (layer {layer})", fontsize=12)
+    plt.suptitle(f"Feature {feature_id} (layer {layer}) — original images", fontsize=12)
     plt.tight_layout()
     plt.show()
 
@@ -205,16 +199,18 @@ def main():
         feature_index = pickle.load(f)
     print(f"Loaded {len(feature_index)} features")
 
+    # ── 调试模式：只看单个 feature ──
     if args.debug_feature is not None:
         fid = args.debug_feature
         if fid not in feature_index:
             print(f"Feature {fid} not found in index")
             return
         entries     = feature_index[fid][:TOP_N_IMAGES]
-        top_results = [r for r in (make_masked_from_index(e) for e in entries) if r]
+        top_results = [r for r in (load_original_image(e) for e in entries) if r]
         visualize_feature(fid, top_results, args.layer)
         return
 
+    # ── 批量标注 ──
     ann_processor, ann_model = load_annotator()
 
     label_path = os.path.join(CFG.label_dir, f"feature_labels_layer{args.layer}.json")
@@ -234,7 +230,7 @@ def main():
             continue
 
         entries     = feature_index[fid][:TOP_N_IMAGES]
-        top_results = [r for r in (make_masked_from_index(e) for e in entries) if r]
+        top_results = [r for r in (load_original_image(e) for e in entries) if r]
 
         if not top_results:
             continue

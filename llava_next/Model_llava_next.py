@@ -1,27 +1,16 @@
 """
-LlavaOVWithClusterPredictorAndSAE — LLaVA-OneVision 适配版
+LlavaNextWithClusterPredictorAndSAE — LLaVA-NeXT-LLaMA3 适配版
 
-从 QwenWithClusterPredictorAndSAE 移植而来。
-核心的 hook 注入逻辑、SAE 稀疏注入、SemanticCompleter、PCA Suppressor 完全复用，
-只适配了以下 LLaVA-OneVision 特有的部分：
+适配 llava-hf/llama3-llava-next-8b-hf
 
-适配点：
-  1. _find_layers:   LLaVA-OV 的 transformer layers 路径
-  2. _build_inputs:  LLaVA-OV 的 processor 和 conversation template
-  3. _get_token_positions: LLaVA-OV 的 vision token 定位（<image> token 展开后的位置）
-  4. _build_labels:  LLaVA-OV 的 chat template 格式
-  5. from_pretrained: LLaVA-OV 的模型加载
-
-LLaVA-OneVision 架构要点：
-  - LLM backbone: Qwen2 (与 Qwen2.5-VL 共享 backbone 家族)
-  - Vision encoder: SigLIP → MLP projector → LLM token 序列
-  - Vision tokens 通过 <image> placeholder 展开后拼入 LLM 输入序列
-  - 支持动态分辨率 (anyres)
-
-修复：
-  - Hook 输出格式：LLaVA-OV 的 Qwen2DecoderLayer 输出 hidden_states 是
-    3D (batch, seq, dim)，且 output 始终是 tuple。不需要 squeeze/unsqueeze。
-    修改后严格保持原始 output tuple 结构，只替换 output[0]。
+与 LLaVA-OneVision 版的关键区别：
+  1. 模型类：LlavaNextForConditionalGeneration (不是 LlavaOnevision)
+  2. Processor：LlavaNextProcessor
+  3. LLM backbone：LLaMA3-8B (hidden_size=4096, 32 layers)
+  4. Vision encoder：CLIP ViT-L/14-336 (不是 SigLIP)
+  5. image_token_index：128256 (不是 151646)
+  6. Chat template：LLaMA3 格式 (<|start_header_id|>...<|end_header_id|>)
+  7. SAE 必须重新训练（hidden_size 从 3584 → 4096）
 """
 import os
 import json
@@ -31,10 +20,9 @@ import torch.nn.functional as F
 from typing import Optional, List, Tuple, Dict, Any
 from src.SAE import SAE
 
-# ── 复用的子模块（与 Qwen 版完全相同）─────────────────────────────────────────
+# ── 复用的子模块（与 Qwen/OV 版完全相同）─────────────────────────────────────
 
 class ClusterPredictor(nn.Module):
-    """Text hidden → cluster logits"""
     def __init__(self, dim: int, n_clusters: int):
         super().__init__()
         self.head = nn.Sequential(
@@ -50,7 +38,6 @@ class ClusterPredictor(nn.Module):
 
 
 class ImageClusterScorer(nn.Module):
-    """Vision hidden → cluster logits（用于 alignment loss）"""
     def __init__(self, dim: int, n_clusters: int):
         super().__init__()
         self.head = nn.Sequential(
@@ -64,7 +51,6 @@ class ImageClusterScorer(nn.Module):
 
 
 class ExtraProjector(nn.Module):
-    """SAE reconstructed features → projected for cross-attention K/V"""
     def __init__(self, dim: int):
         super().__init__()
         self.norm = nn.LayerNorm(dim)
@@ -76,7 +62,6 @@ class ExtraProjector(nn.Module):
 
 
 class SemanticCrossAttention(nn.Module):
-    """Sparse local cross-attention: 只更新被选中的 vision patches"""
     def __init__(self, dim: int):
         super().__init__()
         self.dim = dim
@@ -98,7 +83,6 @@ class SemanticCrossAttention(nn.Module):
 
 
 class PrincipalComponentSuppressor(nn.Module):
-    """削弱 vision tokens 主成分，迫使模型分散注意力"""
     def __init__(self, n_suppress: int = 3):
         super().__init__()
         self.n_suppress = n_suppress
@@ -117,7 +101,6 @@ class PrincipalComponentSuppressor(nn.Module):
 
 
 class SemanticCompleter(nn.Module):
-    """根据问题语义，预测 SAE latent 空间中应该补充的缺失信息 Δz"""
     def __init__(self, dim: int, latent_dim: int, n_clusters: int = None,
                  bottleneck: int = 128):
         super().__init__()
@@ -144,19 +127,20 @@ class SemanticCompleter(nn.Module):
         return delta_z
 
 
-# ── 自动探测 transformer layers（LLaVA-OneVision 适配）────────────────────────
+# ── 自动探测 transformer layers（LLaVA-NeXT-LLaMA3 适配）─────────────────────
 
 def _find_layers(model):
     """
-    LLaVA-OneVision 的 layers 路径：
-      model.model.language_model.layers  (实测 llava-onevision-qwen2-7b-ov-hf)
-      model.language_model.model.layers  (某些版本)
-      model.model.layers                 (某些封装方式)
+    LLaVA-NeXT 的 layers 路径探测。
+    LlavaNextForConditionalGeneration 的结构：
+      model.language_model.model.layers   (最常见)
+      model.model.language_model.layers
+      model.model.layers
     """
     for path in [
-        lambda m: m.model.language_model.layers,
         lambda m: m.language_model.model.layers,
         lambda m: m.model.language_model.model.layers,
+        lambda m: m.model.language_model.layers,
         lambda m: m.model.layers,
     ]:
         try:
@@ -166,14 +150,14 @@ def _find_layers(model):
         except AttributeError:
             pass
     raise AttributeError(
-        "Cannot find transformer layers in LLaVA-OneVision model. Run:\n"
+        "Cannot find transformer layers in LLaVA-NeXT model. Run:\n"
         "  print([n for n,_ in model.named_modules() if 'layers.0' in n][:5])"
     )
 
 
 # ── 主模型 ────────────────────────────────────────────────────────────────────
 
-class LlavaOVWithClusterPredictorAndSAE(nn.Module):
+class LlavaNextWithClusterPredictorAndSAE(nn.Module):
 
     HOOK_OFF       = 0
     HOOK_READ_ONLY = 1
@@ -205,10 +189,12 @@ class LlavaOVWithClusterPredictorAndSAE(nn.Module):
             self.cluster_to_features.setdefault(cid, []).append(fid)
         self.n_clusters = len(self.clusters)
 
-        # ── LLaVA-OV: hidden_size 从 text_config 获取 ────────────────────────
+        # ── LLaVA-NeXT: hidden_size 从 text_config 获取 ──────────────────────
         dim = base_model.config.text_config.hidden_size
         latent_dim = sae.latent_dim
         device = next(base_model.parameters()).device
+
+        print(f"  LLM hidden_size: {dim}")
 
         self.cluster_predictor    = ClusterPredictor(dim, self.n_clusters).to(device)
         self.image_cluster_scorer = ImageClusterScorer(dim, self.n_clusters).to(device)
@@ -244,11 +230,12 @@ class LlavaOVWithClusterPredictorAndSAE(nn.Module):
     def device(self):
         return next(self.base_model.parameters()).device
 
-    # ── 输入构建（LLaVA-OneVision 适配）───────────────────────────────────────
+    # ── 输入构建（LLaVA-NeXT-LLaMA3 适配）────────────────────────────────────
 
     def _build_inputs(self, image_path, question, answer=None, for_generation=True):
         """
-        LLaVA-OneVision 使用 LlavaOnevisionProcessor。
+        LLaVA-NeXT 使用 LlavaNextProcessor。
+        和 LLaVA-OV 的区别：processor 类不同，但 apply_chat_template 接口相同。
         """
         from PIL import Image
 
@@ -290,14 +277,20 @@ class LlavaOVWithClusterPredictorAndSAE(nn.Module):
 
     def _get_token_positions(self, inputs):
         """
-        LLaVA-OneVision vision token 定位。
+        LLaVA-NeXT-LLaMA3 vision token 定位。
+
+        image_token_index = 128256（LLaMA3 的扩展 vocab）
         """
         ids = inputs["input_ids"][0]
 
+        # ── 获取 image token ID ───────────────────────────────────────────────
         image_token_id = getattr(
             self.base_model.config, "image_token_index",
-            self.processor.tokenizer.convert_tokens_to_ids("<image>"),
+            None,
         )
+        if image_token_id is None:
+            # fallback：尝试从 tokenizer 获取
+            image_token_id = self.processor.tokenizer.convert_tokens_to_ids("<image>")
 
         image_mask = (ids == image_token_id)
         image_positions = image_mask.nonzero(as_tuple=False).squeeze(-1)
@@ -312,13 +305,17 @@ class LlavaOVWithClusterPredictorAndSAE(nn.Module):
         v_pos = image_positions[0].item()
         n_img = image_positions.numel()
 
+        # ── text token 位置 ───────────────────────────────────────────────────
+        # LLaMA3 的 special tokens
         tokenizer = self.processor.tokenizer
         special_ids = set()
 
+        # LLaMA3 特有的 special tokens
         for token_name in [
-            "<|im_start|>", "<|im_end|>",
+            "<|begin_of_text|>", "<|end_of_text|>",
+            "<|start_header_id|>", "<|end_header_id|>",
+            "<|eot_id|>",
             "<image>",
-            "<s>", "</s>",
             "<pad>",
         ]:
             tid = tokenizer.convert_tokens_to_ids(token_name)
@@ -339,31 +336,16 @@ class LlavaOVWithClusterPredictorAndSAE(nn.Module):
 
         return v_pos, n_img, text_pos
 
-    # ── 中间层 Hook（修复 LLaVA-OV 输出格式）──────────────────────────────────
+    # ── 中间层 Hook ───────────────────────────────────────────────────────────
 
     def _mid_layer_hook(self, module, input, output):
-        """
-        Qwen2DecoderLayer.forward() 返回值：
-            output = (hidden_states,)                                       — 最常见
-            output = (hidden_states, attn_weights)                          — output_attentions=True
-            output = (hidden_states, attn_weights, present_key_value)       — with cache
-
-        hidden_states 可能是:
-            - 3D (batch, seq_len, hidden_size)  — 大多数情况
-            - 2D (seq_len, hidden_size)          — 某些模型/配置下 batch=1 时会 squeeze
-
-        修复要点：
-          1. 统一转为 3D 处理，返回时还原为原始维度
-          2. 返回时保持原始 tuple 结构
-        """
         if self._hook_fired:
             return output
 
-        # ── 提取 hidden_states，统一为 3D ─────────────────────────────────────
         is_tuple = isinstance(output, tuple)
         raw_hs = output[0] if is_tuple else output
         was_2d = (raw_hs.dim() == 2)
-        hs = raw_hs.unsqueeze(0) if was_2d else raw_hs  # 确保 (batch, seq, dim)
+        hs = raw_hs.unsqueeze(0) if was_2d else raw_hs
 
         if hs.shape[1] <= 1:
             return output
@@ -371,7 +353,7 @@ class LlavaOVWithClusterPredictorAndSAE(nn.Module):
         self._hook_fired = True
         v_pos, n_img, text_pos = self._cached_positions
 
-        # ── Step 1: Cluster 预测 ──────────────────────────────────────────────
+        # ── Cluster 预测 ──────────────────────────────────────────────────────
         logits = self.cluster_predictor(hs, text_pos)
         self._stashed_logits = logits
 
@@ -391,7 +373,7 @@ class LlavaOVWithClusterPredictorAndSAE(nn.Module):
         if self._hook_mode == self.HOOK_READ_ONLY:
             return output
 
-        # ── Stage 2 / 推理: 连续加权稀疏注入 ─────────────────────────────────
+        # ── 稀疏注入 ─────────────────────────────────────────────────────────
         injection = self._build_sparse_injection(
             hs, top_cids, probs_with_grad, v_pos, n_img, text_pos,
         )
@@ -405,7 +387,6 @@ class LlavaOVWithClusterPredictorAndSAE(nn.Module):
         updated = self.semantic_cross_attn(vision_active, recon_projected)
         hs_mod[0, v_pos + active_indices, :] = updated.to(hs.dtype)
 
-        # ── 还原维度 + 保持 tuple 结构 ───────────────────────────────────────
         if was_2d:
             hs_mod = hs_mod.squeeze(0)
         if is_tuple:
@@ -413,9 +394,6 @@ class LlavaOVWithClusterPredictorAndSAE(nn.Module):
         return hs_mod
 
     def _suppress_hook(self, module, input, output):
-        """
-        PCA suppression hook。处理 2D/3D 两种输出格式。
-        """
         if self._suppress_hook_fired:
             return output
 
@@ -634,36 +612,70 @@ class LlavaOVWithClusterPredictorAndSAE(nn.Module):
 
     def _build_labels(self, input_ids):
         """
-        LLaVA-OneVision label 构建（chatml 格式）。
-        只对最后一个 assistant turn 的内容计算 loss。
+        LLaMA3 chat template label 构建。
+
+        LLaMA3 格式：
+          <|begin_of_text|><|start_header_id|>user<|end_header_id|>
+          ...
+          <|eot_id|><|start_header_id|>assistant<|end_header_id|>
+          ...answer...
+          <|eot_id|>
+
+        只对最后一个 assistant 回复内容计算 loss。
         """
         labels = input_ids.clone()
         tokenizer = self.processor.tokenizer
 
-        im_start = tokenizer.convert_tokens_to_ids("<|im_start|>")
+        # ── 尝试 LLaMA3 格式 ─────────────────────────────────────────────────
+        # 找 <|start_header_id|>assistant<|end_header_id|> 的位置
+        start_header_id = tokenizer.convert_tokens_to_ids("<|start_header_id|>")
+        end_header_id = tokenizer.convert_tokens_to_ids("<|end_header_id|>")
 
-        if im_start is not None and im_start != tokenizer.unk_token_id:
+        if (start_header_id is not None and start_header_id != tokenizer.unk_token_id
+                and end_header_id is not None and end_header_id != tokenizer.unk_token_id):
             ast_ids = tokenizer.encode("assistant", add_special_tokens=False)
+
             for b in range(input_ids.shape[0]):
                 ids = input_ids[b].tolist()
-                start = None
-                for i in range(len(ids) - 2, -1, -1):
-                    if ids[i] == im_start and ids[i+1:i+1+len(ast_ids)] == ast_ids:
-                        start = i + 1 + len(ast_ids) + 1
-                        break
-                labels[b, :start if start else len(ids)] = -100
+                answer_start = None
+
+                # 从后往前找最后一个 <|start_header_id|> assistant <|end_header_id|>
+                for i in range(len(ids) - 3, -1, -1):
+                    if ids[i] == start_header_id:
+                        # 检查后面是否跟着 "assistant" 和 <|end_header_id|>
+                        ast_end = i + 1 + len(ast_ids)
+                        if (ids[i+1:ast_end] == ast_ids
+                                and ast_end < len(ids)
+                                and ids[ast_end] == end_header_id):
+                            # answer 内容从 <|end_header_id|> 后面的 \n 开始
+                            answer_start = ast_end + 1
+                            # 跳过可能的换行符 token
+                            while (answer_start < len(ids)
+                                   and tokenizer.decode([ids[answer_start]]).strip() == ""):
+                                answer_start += 1
+                            break
+
+                if answer_start is not None:
+                    labels[b, :answer_start] = -100
+                else:
+                    # fallback
+                    labels[b, :int(len(ids) * 0.8)] = -100
         else:
-            inst_end = tokenizer.encode("[/INST]", add_special_tokens=False)
-            for b in range(input_ids.shape[0]):
-                ids = input_ids[b].tolist()
-                start = None
-                for i in range(len(ids) - len(inst_end), -1, -1):
-                    if ids[i:i+len(inst_end)] == inst_end:
-                        start = i + len(inst_end)
-                        break
-                if start is None:
-                    start = int(len(ids) * 0.8)
-                labels[b, :start] = -100
+            # ── fallback: chatml 格式（以防万一）──────────────────────────────
+            im_start = tokenizer.convert_tokens_to_ids("<|im_start|>")
+            if im_start is not None and im_start != tokenizer.unk_token_id:
+                ast_ids = tokenizer.encode("assistant", add_special_tokens=False)
+                for b in range(input_ids.shape[0]):
+                    ids = input_ids[b].tolist()
+                    start = None
+                    for i in range(len(ids) - 2, -1, -1):
+                        if ids[i] == im_start and ids[i+1:i+1+len(ast_ids)] == ast_ids:
+                            start = i + 1 + len(ast_ids) + 1
+                            break
+                    labels[b, :start if start else len(ids)] = -100
+            else:
+                for b in range(input_ids.shape[0]):
+                    labels[b, :int(len(input_ids[b]) * 0.8)] = -100
 
         return labels.to(self.device)
 
@@ -710,11 +722,16 @@ class LlavaOVWithClusterPredictorAndSAE(nn.Module):
                         top_k_clusters=10, cluster_threshold=0.5,
                         bce_lambda=0.5, align_lambda=0.3,
                         predictor_ckpt=None, device="cuda"):
-        from transformers import AutoProcessor, LlavaOnevisionForConditionalGeneration
+        """
+        加载 LLaVA-NeXT-LLaMA3 模型。
 
-        print(f"Loading LLaVA-OneVision: {model_id}...")
-        processor = AutoProcessor.from_pretrained(model_id)
-        base_model = LlavaOnevisionForConditionalGeneration.from_pretrained(
+        model_id: "llava-hf/llama3-llava-next-8b-hf"
+        """
+        from transformers import LlavaNextProcessor, LlavaNextForConditionalGeneration
+
+        print(f"Loading LLaVA-NeXT: {model_id}...")
+        processor = LlavaNextProcessor.from_pretrained(model_id)
+        base_model = LlavaNextForConditionalGeneration.from_pretrained(
             model_id, torch_dtype=torch.bfloat16,
         ).to(device)
 

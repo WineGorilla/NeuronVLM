@@ -24,7 +24,7 @@
     }
 
 用法：
-    python scripts/cluster_features.py --layer 8 --n_clusters 128
+    python scripts/cluster_features.py --layer 8 --n_clusters 64
 """
 import os
 import sys

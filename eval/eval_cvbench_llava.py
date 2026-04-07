@@ -97,7 +97,7 @@ def load_base_model(model_id):
 
 def load_enhanced_model(args):
     """带 ClusterPredictor + SAE + SemanticCompleter + PCS 的增强模型。"""
-    from src.Model_llava import LlavaOVWithClusterPredictorAndSAE
+    from llava.Model_llava import LlavaOVWithClusterPredictorAndSAE
 
     print("Loading enhanced LLaVA-OneVision model...")
     cluster_path = os.path.join(CFG.label_dir, f"feature_clusters_layer{args.layer}.json")
@@ -386,7 +386,7 @@ def main():
                         help="HuggingFace model ID for LLaVA-OneVision")
     parser.add_argument("--layer", type=int, default=CFG.vis_layer)
     parser.add_argument("--predictor_ckpt", type=str,
-                        default="outputs/llava_ckpt/predictor_best.pt")
+                        default="outputs/llava_focus_ckpt/predictor_best.pt")
     parser.add_argument("--llava_ckpt", type=str, default=None,
                         help="Stage 2 finetuned weights for enhanced model")
     parser.add_argument("--subset", type=str, default=None, choices=["2D", "3D"])

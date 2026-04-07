@@ -7,8 +7,8 @@ Vision Token 热图可视化 — 查看模型在 SAE inject 层和 PCS suppress 
 
 用法：
     python src/visualize_heatmap.py \
-        --image data/images/train2014/COCO_train2014_000000415275.jpg \
-        --question "Is there organic food in this store?" \
+        --image data/images/train2014/COCO_train2014_000000394476.jpg \
+        --question "Is the bathroom clean?" \
         --predictor_ckpt outputs/focus_ckpt_0.75_64_5000/predictor_best.pt \
         --save_dir outputs/heatmaps
 
@@ -244,7 +244,7 @@ class HeatmapVisualizer:
                 (hm / (hm.max() + 1e-8) * 255).astype(np.uint8)
             ).resize((W * 14, H * 14), Image.BILINEAR))
             ax.imshow(hm_r, cmap="jet", alpha=0.5)
-            ax.set_title(f"Cluster {cid}\n{cdata['name']}", fontsize=10)
+            ax.set_title(f"Cluster {cid}\n", fontsize=10)
             ax.axis("off")
 
         # 隐藏多余子图

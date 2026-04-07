@@ -1,25 +1,26 @@
 """
-Vision Token 热图可视化 — 查看模型在 SAE inject 层和 PCS suppress 层的聚焦区域。
+Vision Token 热图可视化 — 对比原始模型 vs 增强模型在 inject 层的聚焦区域。
 
 生成两类热图：
-  1. SAE Inject 层: 哪些 vision patches 被语义注入激活（cluster activation 强度）
-  2. PCS Suppress 层: 主成分抑制前后 vision tokens 的能量分布变化
+  1. SAE Cluster Activation: 哪些 vision patches 被语义注入激活（per-cluster 热图）
+  2. Vanilla vs Enhanced: 原始 Qwen 和增强后模型在 inject 层的 vision token 能量对比
 
 用法：
+    # 看 SAE cluster 激活热图
     python src/v.py \
-        --image data/images/train2014/COCO_train2014_000000525563.jpg \
-        --question "How many animals are in the picture?" \
-        --predictor_ckpt outputs/focus_ckpt_0.75_64_5000/predictor_best.pt  \
-        --save_dir outputs/heatmaps
+        --image data/images/train2014/COCO_train2014_000000394476.jpg \
+        --question "Is the bathroom clean?" \
+        --predictor_ckpt outputs/focus_ckpt_0.75_64_5000/predictor_best.pt \
+        --vis combined
 
-    # 只看 SAE 层
-    python src/visualize_heatmap.py --image xxx.jpg --question "..." --vis sae
-
-    # 只看 PCS 层
-    python src/visualize_heatmap.py --image xxx.jpg --question "..." --vis pcs
+    # 看原始 vs 增强对比
+    python src/visualize_heatmap.py --image xxx.jpg --question "..." --vis compare
 
     # 都看
     python src/visualize_heatmap.py --image xxx.jpg --question "..." --vis both
+
+    # 合并成一张大图
+    python src/visualize_heatmap.py --image xxx.jpg --question "..." --vis combined
 """
 import os
 import sys
@@ -31,7 +32,6 @@ import torch
 import torch.nn.functional as F
 import numpy as np
 import matplotlib.pyplot as plt
-import matplotlib.cm as cm
 from PIL import Image
 
 from config import CFG
@@ -39,33 +39,46 @@ from src.Model import QwenWithClusterPredictorAndSAE, _find_layers
 
 
 class HeatmapVisualizer:
-    """在 SAE inject 层和 PCS suppress 层采集 vision token 信息并生成热图。"""
+    """对比原始模型 vs 增强模型在 inject 层的聚焦区域。"""
 
     def __init__(self, model):
         self.model = model
-        self.sae_layer_data = {}    # SAE inject 层的数据
-        self.pcs_layer_data = {}    # PCS suppress 层的数据
+        self.sae_layer_data = {}
+        self.compare_data = {}
 
     def _get_vision_grid(self, inputs):
-        """获取 vision token 的空间网格尺寸 (H, W)。"""
         grid = inputs["image_grid_thw"]
         merge = self.model.base_model.config.vision_config.spatial_merge_size
         H = int(grid[0, 1].item() // merge)
         W = int(grid[0, 2].item() // merge)
         return H, W
 
+    def _reshape_to_grid(self, data):
+        """把 1D patch 数据 reshape 成 (H, W) 热图。"""
+        H, W = self.grid_H, self.grid_W
+        n = min(len(data), H * W)
+        if n == H * W:
+            return data[:n].reshape(H, W)
+        return np.pad(data, (0, H * W - len(data))).reshape(H, W)
+
+    def _overlay_heatmap(self, ax, img, heatmap, title, cmap="jet", alpha=0.5):
+        """在原图上叠加热图。"""
+        H, W = self.grid_H, self.grid_W
+        ax.imshow(img)
+        hm_norm = (heatmap - heatmap.min()) / (heatmap.max() - heatmap.min() + 1e-8)
+        hm_resized = np.array(Image.fromarray(
+            (hm_norm * 255).astype(np.uint8)
+        ).resize((W * 14, H * 14), Image.BILINEAR))
+        ax.imshow(hm_resized, cmap=cmap, alpha=alpha)
+        ax.set_title(title, fontsize=11)
+        ax.axis("off")
+
     @torch.no_grad()
     def run(self, image_path, question, max_new_tokens=64):
         """
-        执行一次 forward，同时在 SAE 层和 PCS 层捕获 vision hidden states。
-
-        SAE 层捕获：
-          - 每个 vision patch 的 cluster 激活强度
-          - 被 top-k patch 选中的位置
-
-        PCS 层捕获：
-          - 抑制前的 vision hidden states
-          - 抑制后的 vision hidden states（通过 pc_suppressor）
+        两次 forward:
+          Pass 1: 增强模型（开启所有 hook）→ 采集 inject 层 vision hidden + cluster 信息
+          Pass 2: 原始模型（关闭所有 hook）→ 采集 inject 层 vision hidden（vanilla baseline）
         """
         inputs = self.model._build_inputs(image_path, question)
         v_pos, n_img, text_pos = self.model._get_token_positions(inputs)
@@ -77,30 +90,18 @@ class HeatmapVisualizer:
 
         layers = self.model._layers
         inject_idx = self.model.inject_layer
-        suppress_idx = self.model.suppress_layer
 
-        # ── 注册临时 hooks 采集数据 ──────────────────────────────────────────
-        captured = {
-            "sae_pre": None,     # inject 层输出的 vision hidden（注入前）
-            "pcs_pre": None,     # suppress 层输出的 vision hidden（抑制前）
-        }
+        # ══════════════════════════════════════════════════════════════════════
+        # Pass 1: 增强模型（开启 hook），采集 inject 层 vision hidden
+        # ══════════════════════════════════════════════════════════════════════
+        captured = {"enhanced": None}
 
-        def hook_sae(module, input, output):
+        def hook_enhanced(module, input, output):
             hs = output[0]
-            if hs.shape[1] <= 1:
-                return
-            captured["sae_pre"] = hs[0, v_pos:v_pos+n_img, :].detach().float().clone()
+            if hs.shape[1] > 1:
+                captured["enhanced"] = hs[0, v_pos:v_pos+n_img, :].detach().float().clone()
 
-        def hook_pcs(module, input, output):
-            hs = output[0]
-            if hs.shape[1] <= 1:
-                return
-            captured["pcs_pre"] = hs[0, v_pos:v_pos+n_img, :].detach().float().clone()
-
-        h1 = layers[inject_idx].register_forward_hook(hook_sae)
-        h2 = layers[suppress_idx].register_forward_hook(hook_pcs)
-
-        # 同时用模型自带的 hook 做正常推理
+        h_cap = layers[inject_idx].register_forward_hook(hook_enhanced)
         handles = self.model._activate_hook(self.model.HOOK_READ_WRITE)
         try:
             input_len = inputs["input_ids"].shape[1]
@@ -109,59 +110,74 @@ class HeatmapVisualizer:
             )
         finally:
             self.model._deactivate_hook(handles)
-            h1.remove()
-            h2.remove()
+            h_cap.remove()
 
         answer = self.model.processor.decode(
             out_ids[0, input_len:], skip_special_tokens=True
         ).strip()
 
-        # ── 处理 SAE 层数据 ─────────────────────────────────────────────────
-        if captured["sae_pre"] is not None:
-            self._process_sae_layer(captured["sae_pre"], text_pos, inputs)
+        cluster_ids = list(self.model._last_cluster_ids)
+        cluster_names = [
+            self.model.clusters[c]["name"]
+            for c in cluster_ids if c in self.model.clusters
+        ]
 
-        # ── 处理 PCS 层数据 ─────────────────────────────────────────────────
-        if captured["pcs_pre"] is not None:
-            self._process_pcs_layer(captured["pcs_pre"])
+        # 处理 SAE cluster 激活数据
+        if captured["enhanced"] is not None:
+            self._process_sae_layer(captured["enhanced"])
+
+        # ══════════════════════════════════════════════════════════════════════
+        # Pass 2: 原始模型（不开任何 hook），采集 inject 层 vision hidden
+        # ══════════════════════════════════════════════════════════════════════
+        captured_vanilla = {"vanilla": None}
+
+        def hook_vanilla(module, input, output):
+            hs = output[0]
+            if hs.shape[1] > 1:
+                captured_vanilla["vanilla"] = hs[0, v_pos:v_pos+n_img, :].detach().float().clone()
+
+        h_van = layers[inject_idx].register_forward_hook(hook_vanilla)
+        try:
+            self.model.base_model(**inputs, return_dict=True)
+        finally:
+            h_van.remove()
+
+        # 处理对比数据
+        if captured["enhanced"] is not None and captured_vanilla["vanilla"] is not None:
+            self._process_comparison(
+                captured_vanilla["vanilla"],
+                captured["enhanced"],
+            )
 
         return {
             "answer": answer,
-            "cluster_ids": self.model._last_cluster_ids,
-            "cluster_names": [
-                self.model.clusters[c]["name"]
-                for c in self.model._last_cluster_ids
-                if c in self.model.clusters
-            ],
+            "cluster_ids": cluster_ids,
+            "cluster_names": cluster_names,
         }
 
-    def _process_sae_layer(self, vision_h, text_pos, inputs):
+    def _process_sae_layer(self, vision_h):
         """计算每个 vision patch 的 cluster 激活强度。"""
         sae = self.model.sae
         n_patches = vision_h.shape[0]
 
-        # SAE encode
-        z = sae.encode(vision_h)  # (n_patches, latent_dim)
+        z = sae.encode(vision_h)
 
-        # 获取激活的 cluster ids
         cluster_ids = self.model._last_cluster_ids
         if not cluster_ids:
-            # 如果没有激活的 cluster，用所有 z 的 norm 作为热图
             self.sae_layer_data["activation_map"] = z.abs().sum(dim=-1).cpu().numpy()
             self.sae_layer_data["per_cluster"] = {}
             return
 
-        # 总体激活强度（所有激活 cluster 的贡献叠加）
         total_activation = torch.zeros(n_patches, device=vision_h.device)
-
         per_cluster = {}
+
         for cid in cluster_ids:
             fids = [f for f in self.model.cluster_to_features.get(cid, [])
                     if f < z.shape[-1]]
             if not fids:
                 continue
 
-            # 该 cluster 在每个 patch 上的激活强度
-            acts = z[:, fids].sum(dim=-1)  # (n_patches,)
+            acts = z[:, fids].sum(dim=-1)
             total_activation += F.relu(acts)
 
             cname = self.model.clusters.get(cid, {}).get("name", f"cluster_{cid}")
@@ -173,21 +189,10 @@ class HeatmapVisualizer:
         self.sae_layer_data["activation_map"] = total_activation.cpu().numpy()
         self.sae_layer_data["per_cluster"] = per_cluster
 
-    def _process_pcs_layer(self, vision_h):
-        """计算 PCS 抑制前后的能量分布。"""
-        # 抑制前：每个 patch 的 L2 norm（能量）
-        energy_before = vision_h.norm(dim=-1).cpu().numpy()
-
-        # 手动执行 PCS 计算抑制后的结果
-        suppressed = self.model.pc_suppressor(vision_h)
-        energy_after = suppressed.norm(dim=-1).cpu().numpy()
-
-        # 变化量
-        energy_diff = energy_before - energy_after  # 正值 = 被抑制的量
-
-        self.pcs_layer_data["energy_before"] = energy_before
-        self.pcs_layer_data["energy_after"] = energy_after
-        self.pcs_layer_data["energy_diff"] = energy_diff
+    def _process_comparison(self, vanilla_h, enhanced_h):
+        """对比 vanilla vs enhanced 在 inject 层的 vision hidden 能量。"""
+        self.compare_data["vanilla_energy"] = vanilla_h.norm(dim=-1).cpu().numpy()
+        self.compare_data["enhanced_energy"] = enhanced_h.norm(dim=-1).cpu().numpy()
 
     # ── 绘图 ─────────────────────────────────────────────────────────────────
 
@@ -201,12 +206,6 @@ class HeatmapVisualizer:
         per_cluster = self.sae_layer_data.get("per_cluster", {})
         H, W = self.grid_H, self.grid_W
 
-        # 总数量可能与 H*W 不完全匹配（padding等），截取或填充
-        n = min(len(activation), H * W)
-        heatmap = activation[:n].reshape(H, W) if n == H * W else \
-                  np.pad(activation, (0, H*W - len(activation))).reshape(H, W)
-
-        # 计算需要多少子图：1 总体 + 每个 cluster 一个
         n_clusters = len(per_cluster)
         n_plots = 1 + n_clusters
         n_cols = min(4, n_plots)
@@ -218,36 +217,17 @@ class HeatmapVisualizer:
             axes = np.array([axes])
         axes = axes.flatten()
 
-        # ── 总体热图 ──
-        ax = axes[0]
         img = np.array(original_image.resize((W * 14, H * 14)))
-        ax.imshow(img)
-        hm_resized = np.array(Image.fromarray(
-            (heatmap / (heatmap.max() + 1e-8) * 255).astype(np.uint8)
-        ).resize((W * 14, H * 14), Image.BILINEAR))
-        ax.imshow(hm_resized, cmap="jet", alpha=0.5)
-        ax.set_title(f"SAE Layer {self.model.inject_layer}\nAll Clusters Combined",
-                     fontsize=11)
-        ax.axis("off")
 
-        # ── 每个 cluster 的热图 ──
+        heatmap = self._reshape_to_grid(activation)
+        self._overlay_heatmap(axes[0], img, heatmap,
+                              f"SAE Layer {self.model.inject_layer}\nAll Clusters")
+
         for i, (cid, cdata) in enumerate(sorted(per_cluster.items())):
-            ax = axes[1 + i]
-            acts = cdata["activation"]
-            n_c = min(len(acts), H * W)
-            hm = acts[:n_c].reshape(H, W) if n_c == H * W else \
-                 np.pad(acts, (0, H*W - len(acts))).reshape(H, W)
-            hm = np.clip(hm, 0, None)  # ReLU
+            hm = self._reshape_to_grid(np.clip(cdata["activation"], 0, None))
+            self._overlay_heatmap(axes[1 + i], img, hm,
+                                  f"Cluster {cid}\n{cdata['name']}")
 
-            ax.imshow(img)
-            hm_r = np.array(Image.fromarray(
-                (hm / (hm.max() + 1e-8) * 255).astype(np.uint8)
-            ).resize((W * 14, H * 14), Image.BILINEAR))
-            ax.imshow(hm_r, cmap="jet", alpha=0.5)
-            ax.set_title(f"Cluster {cid}\n{cdata['name']}", fontsize=10)
-            ax.axis("off")
-
-        # 隐藏多余子图
         for j in range(1 + n_clusters, len(axes)):
             axes[j].axis("off")
 
@@ -258,134 +238,102 @@ class HeatmapVisualizer:
         plt.show()
         plt.close()
 
-    def plot_pcs_heatmap(self, original_image, save_path=None):
-        """绘制 PCS suppress 层的能量分布热图（抑制前 / 抑制后）。"""
-        if "energy_before" not in self.pcs_layer_data:
-            print("  [warning] No PCS layer data to plot.")
+    def plot_comparison(self, original_image, save_path=None):
+        """绘制 Vanilla vs Enhanced 在 inject 层的能量对比热图。"""
+        if "vanilla_energy" not in self.compare_data:
+            print("  [warning] No comparison data to plot.")
             return
 
         H, W = self.grid_H, self.grid_W
-
-        fig, axes = plt.subplots(1, 2, figsize=(12, 6))
         img = np.array(original_image.resize((W * 14, H * 14)))
 
-        titles = ["Before PCS", "After PCS"]
-        keys = ["energy_before", "energy_after"]
+        fig, axes = plt.subplots(1, 2, figsize=(12, 6))
 
-        # 用相同的 colorbar 范围，方便对比
-        all_vals = np.concatenate([self.pcs_layer_data[k] for k in keys])
-        vmin, vmax = all_vals.min(), all_vals.max()
+        v_energy = self.compare_data["vanilla_energy"]
+        e_energy = self.compare_data["enhanced_energy"]
+        vmin = min(v_energy.min(), e_energy.min())
+        vmax = max(v_energy.max(), e_energy.max())
 
-        for ax, title, key in zip(axes, titles, keys):
-            data = self.pcs_layer_data[key]
-            n = min(len(data), H * W)
-            hm = data[:n].reshape(H, W) if n == H * W else \
-                 np.pad(data, (0, H*W - len(data))).reshape(H, W)
-
+        for ax, data, title in [
+            (axes[0], v_energy, "Vanilla Qwen"),
+            (axes[1], e_energy, "Enhanced (Ours)"),
+        ]:
+            hm = self._reshape_to_grid(data)
             ax.imshow(img)
+            hm_norm = (hm - vmin) / (vmax - vmin + 1e-8)
             hm_r = np.array(Image.fromarray(
-                ((hm - vmin) / (vmax - vmin + 1e-8) * 255
-                 ).astype(np.uint8)
+                (hm_norm * 255).astype(np.uint8)
             ).resize((W * 14, H * 14), Image.BILINEAR))
             ax.imshow(hm_r, cmap="jet", alpha=0.5)
-            ax.set_title(f"PCS Layer {self.model.suppress_layer}\n{title}",
-                         fontsize=11)
+            ax.set_title(f"Layer {self.model.inject_layer}\n{title}", fontsize=12)
             ax.axis("off")
 
-        alpha = F.softplus(self.model.pc_suppressor.alpha_param).item()
-        fig.suptitle(f"Principal Component Suppression (α = {alpha:.4f})",
-                     fontsize=13, y=1.02)
-
+        fig.suptitle("Vision Token Energy Distribution", fontsize=14, y=1.02)
         plt.tight_layout()
         if save_path:
             plt.savefig(save_path, dpi=150, bbox_inches="tight")
-            print(f"  PCS heatmap saved: {save_path}")
+            print(f"  Comparison heatmap saved: {save_path}")
         plt.show()
         plt.close()
 
     def plot_combined(self, original_image, save_path=None):
-        """合并绘制：上排 SAE，下排 PCS。"""
+        """合并: 上排 Vanilla vs Enhanced 对比，下排 SAE cluster 激活。"""
         if "activation_map" not in self.sae_layer_data:
             print("  [warning] No SAE layer data.")
             return
-        if "energy_before" not in self.pcs_layer_data:
-            print("  [warning] No PCS layer data.")
+        if "vanilla_energy" not in self.compare_data:
+            print("  [warning] No comparison data.")
             return
 
         H, W = self.grid_H, self.grid_W
         img = np.array(original_image.resize((W * 14, H * 14)))
 
-        fig, axes = plt.subplots(2, 3, figsize=(18, 12))
-
-        # ── 上排: SAE ──
-        # 总体
-        activation = self.sae_layer_data["activation_map"]
-        n = min(len(activation), H * W)
-        hm = activation[:n].reshape(H, W) if n == H * W else \
-             np.pad(activation, (0, H*W - len(activation))).reshape(H, W)
-
-        ax = axes[0, 0]
-        ax.imshow(img)
-        hm_r = np.array(Image.fromarray(
-            (hm / (hm.max() + 1e-8) * 255).astype(np.uint8)
-        ).resize((W * 14, H * 14), Image.BILINEAR))
-        ax.imshow(hm_r, cmap="jet", alpha=0.5)
-        ax.set_title(f"SAE Layer {self.model.inject_layer}\nAll Clusters", fontsize=11)
-        ax.axis("off")
-
-        # top-2 clusters
         per_cluster = self.sae_layer_data.get("per_cluster", {})
         sorted_clusters = sorted(per_cluster.items(),
                                  key=lambda x: x[1]["activation"].max(),
                                  reverse=True)
-        for i, (cid, cdata) in enumerate(sorted_clusters[:2]):
-            ax = axes[0, 1 + i]
-            acts = cdata["activation"]
-            n_c = min(len(acts), H * W)
-            hm_c = np.clip(acts[:n_c], 0, None)
-            hm_c = hm_c.reshape(H, W) if n_c == H * W else \
-                   np.pad(hm_c, (0, H*W - len(hm_c))).reshape(H, W)
+
+        fig, axes = plt.subplots(2, 3, figsize=(18, 12))
+
+        # ── 上排: Vanilla vs Enhanced ──
+        v_energy = self.compare_data["vanilla_energy"]
+        e_energy = self.compare_data["enhanced_energy"]
+        vmin = min(v_energy.min(), e_energy.min())
+        vmax = max(v_energy.max(), e_energy.max())
+
+        for j, (data, title) in enumerate([
+            (v_energy, "Vanilla Qwen"),
+            (e_energy, "Enhanced (Ours)"),
+        ]):
+            ax = axes[0, j]
+            hm = self._reshape_to_grid(data)
             ax.imshow(img)
+            hm_norm = (hm - vmin) / (vmax - vmin + 1e-8)
             hm_r = np.array(Image.fromarray(
-                (hm_c / (hm_c.max() + 1e-8) * 255).astype(np.uint8)
+                (hm_norm * 255).astype(np.uint8)
             ).resize((W * 14, H * 14), Image.BILINEAR))
             ax.imshow(hm_r, cmap="jet", alpha=0.5)
-            ax.set_title(f"Cluster {cid}: {cdata['name']}", fontsize=10)
+            ax.set_title(f"Layer {self.model.inject_layer} | {title}", fontsize=11)
             ax.axis("off")
+
+        axes[0, 2].axis("off")
+
+        # ── 下排: SAE cluster 激活 ──
+        activation = self.sae_layer_data["activation_map"]
+        hm_all = self._reshape_to_grid(activation)
+        self._overlay_heatmap(axes[1, 0], img, hm_all, "All Clusters")
+
+        for i, (cid, cdata) in enumerate(sorted_clusters[:2]):
+            hm_c = self._reshape_to_grid(np.clip(cdata["activation"], 0, None))
+            self._overlay_heatmap(axes[1, 1 + i], img, hm_c,
+                                  f"Cluster {cid}: {cdata['name']}")
 
         if len(sorted_clusters) < 2:
             for i in range(len(sorted_clusters), 2):
-                axes[0, 1 + i].axis("off")
-
-        # ── 下排: PCS（2 张 + 1 空白）──
-        titles = ["Before PCS", "After PCS"]
-        keys = ["energy_before", "energy_after"]
-
-        all_vals = np.concatenate([self.pcs_layer_data[k] for k in keys])
-        vmin, vmax = all_vals.min(), all_vals.max()
-
-        for j, (title, key) in enumerate(zip(titles, keys)):
-            ax = axes[1, j]
-            data = self.pcs_layer_data[key]
-            n = min(len(data), H * W)
-            hm = data[:n].reshape(H, W) if n == H * W else \
-                 np.pad(data, (0, H*W - len(data))).reshape(H, W)
-            ax.imshow(img)
-            hm_r = np.array(Image.fromarray(
-                ((hm - vmin) / (vmax - vmin + 1e-8) * 255
-                 ).astype(np.uint8)
-            ).resize((W * 14, H * 14), Image.BILINEAR))
-            ax.imshow(hm_r, cmap="jet", alpha=0.5)
-            ax.set_title(f"PCS Layer {self.model.suppress_layer}\n{title}",
-                         fontsize=11)
-            ax.axis("off")
-
-        axes[1, 2].axis("off")
+                axes[1, 1 + i].axis("off")
 
         lam = F.softplus(self.model.semantic_cross_attn.lambda_param).item()
-        alpha = F.softplus(self.model.pc_suppressor.alpha_param).item()
-        fig.suptitle(f"Vision Token Heatmaps  |  λ_inject={lam:.3f}  "
-                     f"α_suppress={alpha:.4f}",
+        fig.suptitle(f"Vision Focus Analysis  |  λ = {lam:.3f}",
                      fontsize=14, y=1.01)
         plt.tight_layout()
         if save_path:
@@ -399,7 +347,7 @@ class HeatmapVisualizer:
 
 def main():
     parser = argparse.ArgumentParser(
-        description="Visualize SAE inject and PCS suppress layer heatmaps"
+        description="Visualize vanilla vs enhanced vision token focus"
     )
     parser.add_argument("--image", type=str, required=True)
     parser.add_argument("--question", type=str, required=True)
@@ -411,8 +359,9 @@ def main():
     parser.add_argument("--max_tokens", type=int, default=64)
     parser.add_argument("--top_k_clusters", type=int, default=10)
     parser.add_argument("--vis", type=str, default="both",
-                        choices=["sae", "pcs", "both", "combined"],
-                        help="sae=SAE层, pcs=PCS层, both=分开画, combined=合并画")
+                        choices=["sae", "compare", "both", "combined"],
+                        help="sae=cluster激活, compare=vanilla vs enhanced, "
+                             "both=分开画, combined=合并一张")
     parser.add_argument("--save_dir", type=str, default="outputs/heatmaps")
     args = parser.parse_args()
 
@@ -455,29 +404,19 @@ def main():
     print(f"Grid     : {viz.grid_H} x {viz.grid_W} = {viz.n_img} patches")
     print(f"{'='*50}")
 
-    # 文件名前缀
     img_name = os.path.splitext(os.path.basename(args.image))[0]
 
-    if args.vis == "sae":
+    if args.vis in ("sae", "both"):
         viz.plot_sae_heatmap(
             original_image,
             save_path=os.path.join(args.save_dir, f"{img_name}_sae.png"),
         )
-    elif args.vis == "pcs":
-        viz.plot_pcs_heatmap(
+    if args.vis in ("compare", "both"):
+        viz.plot_comparison(
             original_image,
-            save_path=os.path.join(args.save_dir, f"{img_name}_pcs.png"),
+            save_path=os.path.join(args.save_dir, f"{img_name}_compare.png"),
         )
-    elif args.vis == "both":
-        viz.plot_sae_heatmap(
-            original_image,
-            save_path=os.path.join(args.save_dir, f"{img_name}_sae.png"),
-        )
-        viz.plot_pcs_heatmap(
-            original_image,
-            save_path=os.path.join(args.save_dir, f"{img_name}_pcs.png"),
-        )
-    elif args.vis == "combined":
+    if args.vis == "combined":
         viz.plot_combined(
             original_image,
             save_path=os.path.join(args.save_dir, f"{img_name}_combined.png"),
