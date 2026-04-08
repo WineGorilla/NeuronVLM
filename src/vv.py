@@ -5,10 +5,10 @@
 低于阈值的区域统一压成最低蓝色。
 
 用法：
-    python src/v.py \
+    python src/vv.py \
         --image data/images/train2014/COCO_train2014_000000524522.jpg \
         --question "Are all the players wearing black shirts?" \
-        --predictor_ckpt outputs/focus_ckpt_0.75_64_5000/predictor_best.pt --n_clusters 2
+        --predictor_ckpt outputs/focus_ckpt_0.75_64_5000/predictor_best.pt --n_clusters 3
 
     python src/visualize_heatmap.py --image xxx.jpg --question "..." --n_clusters 3
     python src/visualize_heatmap.py --image xxx.jpg --question "..." --threshold 0.3
@@ -32,12 +32,9 @@ from src.Model import QwenWithClusterPredictorAndSAE
 
 
 plt.rcParams.update({
+    "font.family": "serif",
+    "font.serif": ["Times New Roman", "DejaVu Serif", "serif"],
     "font.size": 9,
-    "text.color": "black",
-    "axes.labelcolor": "black",
-    "axes.edgecolor": "black",
-    "xtick.color": "black",
-    "ytick.color": "black",
 })
 
 
@@ -190,22 +187,20 @@ class HeatmapVisualizer:
 
         # ── 原图（干净，不做处理）──
         axes[0].imshow(img)
-        axes[0].set_xlabel("Input Image", fontsize=16, labelpad=4)
+        axes[0].set_xlabel("Input Image", fontsize=9, labelpad=4)
         axes[0].set_xticks([]); axes[0].set_yticks([])
         for s in axes[0].spines.values():
-            s.set_linewidth(0.4); s.set_color("black")
+            s.set_linewidth(0.4); s.set_color("#999999")
 
-        # ── Overall Focus（只叠加显示的 top-N clusters）──
-        shown_total = np.zeros_like(self.sae_layer_data["total"])
-        for _, acts in sorted_clusters[:n_show]:
-            shown_total += np.clip(acts, 0, None)
-        hm = _reshape_to_grid(shown_total, H, W)
+        # ── Overall Focus ──
+        total = self.sae_layer_data["total"]
+        hm = _reshape_to_grid(total, H, W)
         overlay = _render_overlay(img, hm, threshold=threshold, alpha=alpha)
         axes[1].imshow(overlay)
-        axes[1].set_xlabel("Overall Focus", fontsize=16, labelpad=4)
+        axes[1].set_xlabel("Overall Focus", fontsize=9, labelpad=4)
         axes[1].set_xticks([]); axes[1].set_yticks([])
         for s in axes[1].spines.values():
-            s.set_linewidth(0.4); s.set_color("black")
+            s.set_linewidth(0.4); s.set_color("#999999")
 
         # ── Neuron Cluster 1, 2, 3... ──
         for i, (cid, acts) in enumerate(sorted_clusters[:n_show]):
@@ -214,10 +209,10 @@ class HeatmapVisualizer:
             hm_c = _reshape_to_grid(acts_clip, H, W)
             overlay_c = _render_overlay(img, hm_c, threshold=threshold, alpha=alpha)
             ax.imshow(overlay_c)
-            ax.set_xlabel(f"Neuron Cluster {cid}", fontsize=16, labelpad=4)
+            ax.set_xlabel(f"Neuron Cluster {cid}", fontsize=9, labelpad=4)
             ax.set_xticks([]); ax.set_yticks([])
             for s in ax.spines.values():
-                s.set_linewidth(0.4); s.set_color("black")
+                s.set_linewidth(0.4); s.set_color("#999999")
 
         if save_path:
             fig.savefig(save_path, dpi=300, bbox_inches="tight", pad_inches=0.03,

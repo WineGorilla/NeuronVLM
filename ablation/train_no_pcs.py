@@ -2,7 +2,7 @@
 消融实验训练脚本：无 PCA 主成分抑制
 
 用法：
-  Stage 1: python -m ablation.train_no_pcs --stage 1
+  Stage 1: python -m ablation.train_no_pcs --stage 1 && python -m ablation.train_no_pcs --stage 2 --resume best
   Stage 2: python -m ablation.train_no_pcs --stage 2 --resume best
 """
 import os

@@ -251,7 +251,7 @@ def evaluate_base(base_model, processor, dataset, save_path=None, label="base"):
             with torch.no_grad():
                 output_ids = base_model.generate(
                     **inputs,
-                    max_new_tokens=32,
+                    max_new_tokens=128, #basic是32
                     do_sample=False,
                 )
             input_len = inputs["input_ids"].shape[1]
