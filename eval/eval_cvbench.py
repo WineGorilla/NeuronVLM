@@ -2,8 +2,8 @@
 CV-Bench 评估脚本。
 
 用法：
-    python eval/eval_cvbench.py --mode base
-    CUDA_VISIBLE_DEVICES=1 python eval/eval_cvbench.py --mode enhanced
+    CUDA_VISIBLE_DEVICES=0 python eval/eval_cvbench.py --mode base
+    CUDA_VISIBLE_DEVICES=0 python eval/eval_cvbench.py --mode enhanced
     python eval/eval_cvbench.py --mode spatial --qwen_ckpt outputs/focus_v2_ckpt/qwen_best.pt
     python eval/eval_cvbench.py --mode finetune_baseline --qwen_ckpt outputs/ablation_baseline/qwen_best.pt
     python eval/eval_cvbench.py --mode no_pcs --no_pcs_qwen_ckpt outputs/ablation_no_pcs/qwen_best.pt
@@ -38,7 +38,8 @@ def build_prompt(prompt: str, choices: list) -> str:
         "Answer the following question.\n"
         "Select the correct option and output ONLY the letter.\n"
         "Do NOT output explanation.\n"
-    )
+    ) #这是正式的
+
     return f"{instruction}\n{prompt}\n\nChoices:\n{choice_text}\n\nAnswer:"
 
 
@@ -251,7 +252,7 @@ def evaluate_base(base_model, processor, dataset, save_path=None, label="base"):
             with torch.no_grad():
                 output_ids = base_model.generate(
                     **inputs,
-                    max_new_tokens=128, #basic是32
+                    max_new_tokens=32, #basic是32
                     do_sample=False,
                 )
             input_len = inputs["input_ids"].shape[1]

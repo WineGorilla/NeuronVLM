@@ -1,8 +1,15 @@
 """
-SAE 训练入口 — LLaVA-NeXT-LLaMA3 版。
+SAE 训练入口 — LLaVA-NeXT-LLaMA3 版（修正版）。
+修正点：
+  1. SAE 加入 b1/b2/b3 偏置项（论文公式）
+  2. 加入 auxiliary loss 防止 dead features
+  3. 加入 gradient accumulation（论文用 8*4=32 effective batch）
+  4. vision token 提取改用 mask 方式（兼容 anyres）
+  5. TopK SAE 不再加额外 L1 sparsity
+
 用法：
-    python -m llava_next.train_sae_llava_next --max_steps 5000
-    python -m llava_next.train_sae_llava_next --max_steps 25000
+    python -m llava_next.train_sae_llava_next --max_steps 10000
+    CUDA_VISIBLE_DEVICES=0 python -m llava_next.train_sae_llava_next
 """
 import os
 import sys
@@ -16,15 +23,20 @@ from torch.utils.data import DataLoader
 from transformers import LlavaNextProcessor, LlavaNextForConditionalGeneration
 import transformers
 
-from config import CFG
-from src.SAE import SAE
+from llava_next.config_llava import CFG
+from llava_next.SAE_llava import SAE
 from llava_next.dataset_llava_next import VisionTextDataset, build_collate
 
 transformers.logging.set_verbosity_error()
 
-# ── 路径配置（需要在 config.py 中添加，或使用 fallback）────────────────────────
+# ── 路径配置 ──────────────────────────────────────────────────
 LLAVA_NEXT_MODEL_ID = getattr(CFG, "llava_next_model_id", "llava-hf/llama3-llava-next-8b-hf")
 SAVE_DIR            = getattr(CFG, "save_llava_next_dir", "outputs/sae_llava_next")
+
+# ── 训练超参数（可在 config 中覆盖）─────────────────────────────
+GRAD_ACCUM   = getattr(CFG, "grad_accum_steps", 4)   # 论文: 8 batch * 4 accum = 32
+AUX_COEF     = getattr(CFG, "aux_coef", 1/32)        # auxiliary loss 系数
+DEAD_THRESH  = getattr(CFG, "dead_threshold", 40)     # 多少 batch 没激活算 dead
 
 
 class UniqueImageDataset(VisionTextDataset):
@@ -41,16 +53,20 @@ class UniqueImageDataset(VisionTextDataset):
         self.samples = deduped
 
 
-def _find_vision_token_range(input_ids, image_token_id):
-    image_mask = (input_ids == image_token_id)
-    image_positions = image_mask.nonzero(as_tuple=False).squeeze(-1)
-
-    if image_positions.numel() == 0:
-        return None, 0
-
-    v_pos = image_positions[0].item()
-    n_img = image_positions.numel()
-    return v_pos, n_img
+def extract_vision_hidden(hidden_state, input_ids, image_token_id):
+    """
+    从 hidden_state 中提取所有 vision token。
+    用 mask 方式，兼容 anyres 下 vision tokens 不连续的情况。
+    返回 (N_total_vision_tokens, hidden_dim) 或 None。
+    """
+    parts = []
+    for b in range(hidden_state.shape[0]):
+        mask = (input_ids[b] == image_token_id)
+        if mask.any():
+            parts.append(hidden_state[b][mask])
+    if not parts:
+        return None
+    return torch.cat(parts, dim=0)
 
 
 def train():
@@ -61,7 +77,7 @@ def train():
 
     os.makedirs(SAVE_DIR, exist_ok=True)
 
-    # ── 加载 LLaVA-NeXT-LLaMA3 ───────────────────────────────────────────────
+    # ── 加载 LLaVA-NeXT-LLaMA3 ───────────────────────────────
     print(f"Loading LLaVA-NeXT-LLaMA3: {LLAVA_NEXT_MODEL_ID}")
     processor = LlavaNextProcessor.from_pretrained(LLAVA_NEXT_MODEL_ID)
     model = LlavaNextForConditionalGeneration.from_pretrained(
@@ -72,7 +88,7 @@ def train():
     for p in model.parameters():
         p.requires_grad = False
 
-    # ── LLaMA3-8B: hidden_size=4096 ──────────────────────────────────────────
+    # ── hidden_dim & SAE ──────────────────────────────────────
     hidden_dim = model.config.text_config.hidden_size
     latent_dim = hidden_dim * CFG.latent_mult
     print(f"hidden_dim={hidden_dim}, latent_dim={latent_dim}")
@@ -93,7 +109,6 @@ def train():
         collate_fn = build_collate(processor),
     )
 
-    # ── image_token_index: LLaMA3 版是 128256 ────────────────────────────────
     image_token_id = getattr(
         model.config, "image_token_index",
         processor.tokenizer.convert_tokens_to_ids("<image>"),
@@ -102,6 +117,10 @@ def train():
 
     print(f"Dataset size       : {len(dataset)} (unique images)")
     print(f"Image token ID     : {image_token_id}")
+    print(f"Layers             : {CFG.layers}")
+    print(f"Grad accumulation  : {GRAD_ACCUM}")
+    print(f"Effective batch    : {CFG.batch_size * GRAD_ACCUM}")
+    print(f"Aux loss coef      : {AUX_COEF}")
     print(f"Save every         : {save_every} steps")
 
     def save_checkpoints(tag="latest"):
@@ -120,6 +139,9 @@ def train():
     signal.signal(signal.SIGINT, handle_sigint)
 
     optimizer_step = 0
+    micro_step     = 0
+    accum_loss     = 0.0
+    optimizer.zero_grad()
 
     for epoch in range(CFG.sae_epochs):
         print(f"\nEpoch {epoch}")
@@ -137,12 +159,7 @@ def train():
                     return_dict=True,
                 )
 
-            input_ids = batch["input_ids"][0]
-            v_pos, n_img = _find_vision_token_range(input_ids, image_token_id)
-
-            if v_pos is None or n_img == 0:
-                print(f"  [skip] step {step}: no vision tokens found")
-                continue
+            input_ids = batch["input_ids"]
 
             loss_total = 0.0
             skip       = False
@@ -150,46 +167,70 @@ def train():
             for l in CFG.layers:
                 h = outputs.hidden_states[l + 1]
 
-                img_tokens = h[:, v_pos:v_pos + n_img, :]
-                flat       = img_tokens.reshape(-1, img_tokens.shape[-1]).float()
+                # ── 提取 vision tokens（mask 方式，兼容 anyres）──
+                img_tokens = extract_vision_hidden(h, input_ids, image_token_id)
 
-                if torch.isnan(flat).any() or torch.isinf(flat).any():
+                if img_tokens is None or img_tokens.shape[0] == 0:
+                    print(f"  [skip] step {step}: no vision tokens found")
+                    skip = True
+                    break
+
+                img_tokens = img_tokens.float()
+
+                if torch.isnan(img_tokens).any() or torch.isinf(img_tokens).any():
                     print(f"  [skip] step {step} layer {l}: nan/inf")
                     skip = True
                     break
 
-                sae       = saes[l]
-                recon, z  = sae(flat)
+                sae = saes[l]
+                recon, z = sae(img_tokens)
 
-                loss = F.mse_loss(recon, flat) + CFG.sparsity_coef * z.abs().mean()
+                # ── 论文 loss: MSE + auxiliary（不加额外 L1）────
+                recon_loss = F.mse_loss(recon, img_tokens)
+                aux_loss   = sae.auxiliary_loss(img_tokens, recon, DEAD_THRESH)
+                loss       = recon_loss + AUX_COEF * aux_loss
+
+                # 更新 dead feature 统计
+                sae.update_fired_stats(z)
+
                 loss_total += loss
 
             if skip:
-                optimizer.zero_grad()
                 continue
 
             loss_total /= len(CFG.layers)
 
-            optimizer.zero_grad()
-            loss_total.backward()
-            torch.nn.utils.clip_grad_norm_(sae_params, max_norm=1.0)
-            optimizer.step()
-            optimizer_step += 1
+            # ── gradient accumulation ─────────────────────────
+            (loss_total / GRAD_ACCUM).backward()
+            accum_loss += loss_total.item()
+            micro_step += 1
 
-            for sae in saes.values():
-                sae.normalize_decoder()
+            if micro_step % GRAD_ACCUM == 0:
+                torch.nn.utils.clip_grad_norm_(sae_params, max_norm=1.0)
+                optimizer.step()
+                optimizer.zero_grad()
+                optimizer_step += 1
 
-            if optimizer_step % save_every == 0:
-                save_checkpoints(f"step{optimizer_step}")
+                for sae in saes.values():
+                    sae.normalize_decoder()
 
-            if step % 10 == 0:
-                print(f"  step {step:6d} | loss {loss_total.item():.6f}")
+                if optimizer_step % save_every == 0:
+                    save_checkpoints(f"step{optimizer_step}")
 
-            if args.max_steps and optimizer_step >= args.max_steps:
-                print(f"\n  Reached max_steps={args.max_steps}, stopping.")
-                save_checkpoints(f"step{optimizer_step}")
-                print("\nTraining complete.")
-                return
+                if optimizer_step % 10 == 0:
+                    avg = accum_loss / GRAD_ACCUM
+                    n_dead = sum(
+                        (sae.num_batches_since_fired >= DEAD_THRESH).sum().item()
+                        for sae in saes.values()
+                    )
+                    print(f"  step {optimizer_step:6d} | loss {avg:.6f} | dead {n_dead}")
+                    accum_loss = 0.0
+
+                if args.max_steps and optimizer_step >= args.max_steps:
+                    print(f"\n  Reached max_steps={args.max_steps}, stopping.")
+                    save_checkpoints(f"step{optimizer_step}")
+                    print("\nTraining complete.")
+                    return
 
         save_checkpoints(f"epoch{epoch}")
 

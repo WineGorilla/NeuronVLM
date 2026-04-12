@@ -3,7 +3,7 @@
 GPU 加速版本（使用 PyTorch），支持中间 checkpoint 断点续跑 + 定期裁剪防 OOM。
 
 用法：
-    python llava_next/build_feature_index_llava_gpu.py --layer 8 --min_images 3
+    python llava_next/build_feature_index_llava_gpu.py --layer 8 --min_images 10
     python llava/build_feature_index_llava_gpu.py --layer 8 --batch_size 512
     python llava/build_feature_index_llava_gpu.py --layer 8 --checkpoint_every 10000
     python llava/build_feature_index_llava_gpu.py --layer 8 --no_resume
@@ -22,7 +22,7 @@ import numpy as np
 import scipy.sparse as sp
 import torch
 
-from config import CFG
+from llava_next.config_llava import CFG
 
 
 def get_dense_z(item):

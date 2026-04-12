@@ -25,8 +25,8 @@ from transformers import LlavaNextProcessor, LlavaNextForConditionalGeneration
 from PIL import Image
 import transformers
 
-from config import CFG
-from src.SAE import SAE
+from llava_next.config_llava import CFG
+from llava_next.SAE_llava import SAE
 
 transformers.logging.set_verbosity_error()
 

@@ -22,7 +22,7 @@ import matplotlib.pyplot as plt
 from transformers import AutoProcessor, Qwen2_5_VLForConditionalGeneration
 from qwen_vl_utils import process_vision_info
 
-from config import CFG
+from llava_next.config_llava import CFG
 
 
 ANNOTATOR_MODEL_ID = "Qwen/Qwen2.5-VL-7B-Instruct"

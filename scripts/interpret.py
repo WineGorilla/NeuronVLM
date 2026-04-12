@@ -212,7 +212,7 @@ def main():
     os.makedirs(CFG.cache_dir,  exist_ok=True)
     os.makedirs(PREVIEW_DIR,    exist_ok=True)
 
-    index_path = os.path.join(CFG.cache_dir, f"feature_index_layer{args.layer}_3.pkl")
+    index_path = os.path.join(CFG.cache_dir, f"feature_index_layer{args.layer}.pkl")
     if not os.path.exists(index_path):
         print(f"Feature index not found: {index_path}")
         print(f"Please run: python scripts/build_feature_index.py --layer {args.layer}")
