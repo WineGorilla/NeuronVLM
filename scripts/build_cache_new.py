@@ -4,7 +4,7 @@
 不会去提取重复的图片，一张照片只提取一次。
 
 用法：
-    CUDA_VISIBLE_DEVICES=2 python scripts/build_cache_new.py --layer 8 && CUDA_VISIBLE_DEVICES=2 python scripts/build_feature_index_gpu.py --layer 8 --min_images 3 --batch_size 512
+    CUDA_VISIBLE_DEVICES=1 python scripts/build_cache_new.py --layer 10 && CUDA_VISIBLE_DEVICES=1 python scripts/build_feature_index_gpu.py --layer 10 --min_images 3 --batch_size 512
     python scripts/build_cache.py --layer 24
     python scripts/build_cache.py --all    # 构建所有层
 """

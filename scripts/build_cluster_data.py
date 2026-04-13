@@ -11,7 +11,7 @@
     }
 
 用法：
-    python scripts/build_cluster_data.py --layer 8 --max 5000
+    python scripts/build_cluster_data.py --layer 20 --max 5000
     python data/build_cluster_data.py --layer 8
 """
 import os

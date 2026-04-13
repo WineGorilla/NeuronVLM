@@ -24,7 +24,7 @@
     }
 
 用法：
-    python scripts/cluster_features.py --layer 8 --n_clusters 64
+    python scripts/cluster_features.py --layer 12 --n_clusters 64
 """
 import os
 import sys
@@ -79,8 +79,8 @@ def name_cluster_with_claude(cluster_labels: list, cluster_id: int) -> str:
     # 取最多 20 个标签展示给 Claude
     sample = cluster_labels[:20]
     prompt = (
-        f"These are semantic labels of visual features detected by a SAE "
-        f"(Sparse Autoencoder) in a vision-language model:\n\n"
+        f"These are semantic labels of visual features"
+        f"in a vision-language model:\n\n"
         f"{chr(10).join(f'  - {l}' for l in sample)}\n\n"
         f"What is the common visual concept or category these features share?\n"
         f"Give a concise category name of 1-3 words only, no explanation."

@@ -3,7 +3,7 @@
 
 用法：
     python scripts/build_feature_index.py --layer 8
-    python scripts/interpreta.py --layer 8
+    CUDA_VISIBLE_DEVICES=1 python scripts/interpreta.py --layer 8
     python scripts/interpret.py --layer 8 --debug_feature 100
 """
 import os
@@ -27,7 +27,7 @@ from config import CFG
 
 ANNOTATOR_MODEL_ID = "Qwen/Qwen2.5-VL-7B-Instruct"
 TOP_N_IMAGES       = 3
-PREVIEW_DIR        = "newoutputs/qwen/feature_previews"   # 标注时保存拼接图的目录
+PREVIEW_DIR        = "newoutputs/qwen/feature_previews_layer8"   # 标注时保存拼接图的目录
 
 
 # ── 加载标注模型（7B）─────────────────────────────────────────────────────────

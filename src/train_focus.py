@@ -37,7 +37,7 @@ EPOCHS         = 3
 GRAD_ACCUM     = 8
 LOG_EVERY      = 10
 SAVE_EVERY     = 500
-SAVE_DIR       = "outputs/focus_ckpt"
+SAVE_DIR       = "outputs/focus_ckpt_layer20"
 
 
 def main():
