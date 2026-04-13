@@ -10,6 +10,9 @@ SAE 训练入口 — LLaVA-NeXT-LLaMA3 版（修正版）。
 用法：
     python -m llava_next.train_sae_llava_next --max_steps 10000
     CUDA_VISIBLE_DEVICES=0 python -m llava_next.train_sae_llava_next
+
+
+    CUDA_VISIBLE_DEVICES=2 python scripts/build_cache_new.py --layer 20
 """
 import os
 import sys

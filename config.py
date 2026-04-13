@@ -13,11 +13,10 @@ class Config:
     save_llava_next_dir = "outputs/sae_llava_next"
 
     # 数据
-
-    train_file: str = "data/ex.jsonl"#正式版："data/train_vqa2.jsonl"
+    train_file: str = "data/train_vqa2_unique.jsonl"#正式版："data/train_vqa2.jsonl"
 
     # ── SAE 层索引（内部会 +1 以跳过 embedding 层）──────────────
-    layers: List[int] = field(default_factory=lambda: [8])
+    layers: List[int] = field(default_factory=lambda: [12])
 
     # ── SAE 超参 ──────────────────────────────────────────────
     latent_mult: int = 32      # latent_dim = hidden_dim * latent_mult
@@ -28,7 +27,7 @@ class Config:
     sae_epochs:    int   = 1
     epochs:        int   = 2
     lr:            float = 1e-4   # 归一化去掉后可以稍大
-    sparsity_coef: float = 0.05
+    sparsity_coef: float = 0.03 #原本是0.05
     grad_accum:    int   = 6
     save_every: int = 5000   # 每 N 个 optimizer step 保存一次
 
@@ -43,7 +42,7 @@ class Config:
     label_dir: str = "assets"
 
     # ── 推理 / 可视化 
-    vis_layer: int = 8           # 可视化时使用的层
+    vis_layer: int = 12           # 可视化时使用的层
     vis_feature_id: int = 120    # 默认查看的 feature id
     top_n_patches: int = 60     # 每张图保留激活最强的 patch 数 注意llava和qwen是不一样个数的 qwen60 llava480 4倍
     top_n_images: int = 5        # 每个 feature 展示的 top-N 图片数 注意

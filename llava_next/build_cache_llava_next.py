@@ -5,7 +5,9 @@ SAE latent 缓存构建 — LLaVA-NeXT-LLaMA3 版。
 只构建 SAE latent 缓存，不做标注。
 使用数据集中的真实问题构建 prompt，与训练时保持一致。
 
-优化：用 hook 提取目标层后提前终止 forward，省掉后续层的计算。
+【已修复】与 train_sae_llava_next.py 完全对齐：
+  1. 用完整 forward + hidden_states[layer+1]（而非 hook 提前终止）
+  2. 用 image_token_id mask 提取 vision token（与训练一致）
 
 用法：
     python llava_next/build_cache_llava_next.py --layer 8
@@ -56,23 +58,7 @@ def load_sae_model(layer: int):
     return processor, model, sae
 
 
-def _find_layers(model):
-    for path_fn in [
-        lambda m: m.language_model.model.layers,
-        lambda m: m.model.language_model.model.layers,
-        lambda m: m.model.language_model.layers,
-        lambda m: m.model.layers,
-    ]:
-        try:
-            layers = path_fn(model)
-            if hasattr(layers, '__len__') and len(layers) > 0:
-                return layers
-        except AttributeError:
-            pass
-    raise AttributeError("Cannot find transformer layers")
-
-
-def forward_single(image_path: str, question: str, layer: int, processor, model, sae, lm_layers):
+def forward_single(image_path: str, question: str, layer: int, processor, model, sae):
     image = Image.open(image_path).convert("RGB")
 
     conversation = [{
@@ -91,41 +77,33 @@ def forward_single(image_path: str, question: str, layer: int, processor, model,
         return_tensors="pt",
     ).to(CFG.device)
 
-    # ── 用 hook 提取目标层，提前终止 forward ──────────────────
-    captured = {}
+    # ── 完整 forward，与训练一致 ──────────────────────────────
+    with torch.no_grad():
+        outputs = model(
+            **{k: v for k, v in inputs.items() if torch.is_tensor(v)},
+            output_hidden_states=True,
+            return_dict=True,
+        )
 
-    def hook_fn(module, input, output):
-        h = output[0] if isinstance(output, tuple) else output
-        if h.dim() == 2:
-            h = h.unsqueeze(0)
-        captured["hidden"] = h.detach()
-        raise StopIteration
+    # ── 取 hidden_states[layer + 1]，与训练一致 ──────────────
+    h = outputs.hidden_states[layer + 1]
 
-    handle = lm_layers[layer].register_forward_hook(hook_fn)
-    try:
-        with torch.no_grad():
-            model(**inputs)
-    except StopIteration:
-        pass
-    finally:
-        handle.remove()
-
-    h = captured["hidden"]  # (1, seq, dim)
-
+    # ── 用 image_token_id mask 提取 vision token，与训练一致 ──
     input_ids = inputs["input_ids"][0]
     image_token_id = getattr(
         model.config, "image_token_index",
         processor.tokenizer.convert_tokens_to_ids("<image>"),
     )
-    vision_indices = (input_ids == image_token_id).nonzero(as_tuple=False).squeeze(-1)
+    vision_mask = (input_ids == image_token_id)
 
-    if len(vision_indices) == 0:
+    if not vision_mask.any():
         raise ValueError("No vision tokens found")
 
-    img_tokens = h[0, vision_indices, :]
+    img_tokens = h[0, vision_mask, :]  # (num_vision, hidden_dim)
     flat = img_tokens.float()
 
-    n_tokens = len(vision_indices)
+    # ── 计算 H_tok, W_tok 用于后续可视化 ─────────────────────
+    n_tokens = flat.shape[0]
     H_tok = W_tok = int(n_tokens ** 0.5)
     if "image_sizes" in inputs:
         img_sizes = inputs["image_sizes"]
@@ -154,8 +132,7 @@ def build_cache(layer: int):
 
     print(f"[layer {layer}] loading model & SAE...")
     processor, model, sae = load_sae_model(layer)
-    lm_layers = _find_layers(model)
-    print(f"[layer {layer}] found {len(lm_layers)} transformer layers, early stop at layer {layer}")
+    print(f"[layer {layer}] model loaded, using full forward + hidden_states[{layer}+1]")
 
     samples = []
     with open(CFG.train_file) as f:
@@ -181,7 +158,7 @@ def build_cache(layer: int):
 
         try:
             z_sparse, H_tok, W_tok = forward_single(
-                image_path, question, layer, processor, model, sae, lm_layers
+                image_path, question, layer, processor, model, sae
             )
             cache.append({
                 "image_path": image_path,

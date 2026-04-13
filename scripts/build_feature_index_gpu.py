@@ -13,7 +13,8 @@ feature_index 格式：
     image_score 用 top patch 的平均激活值计算，代表该 feature 在这张图里最典型区域的强度。
 
 用法：
-    CUDA_VISIBLE_DEVICES=0 python scripts/build_feature_index_gpu.py --layer 8 --min_images 6 --batch_size 512
+    CUDA_VISIBLE_DEVICES=1 python scripts/build_cache_new.py --layer 16
+    CUDA_VISIBLE_DEVICES=0 python scripts/build_feature_index_gpu.py --layer 8 --min_images 8 --batch_size 512
     python scripts/build_feature_index_gpu.py --layer 8 --top_k 10 --min_images 3
     python scripts/build_feature_index_gpu.py --layer 8 --batch_size 512
 """
@@ -136,7 +137,7 @@ def main():
         end = min(start + batch_size, total)
         batch = cache[start:end]
 
-        batch_results = process_batch_gpu(batch, 5, device)
+        batch_results = process_batch_gpu(batch, CFG.top_n_patches, device)
 
         for image_results in batch_results:
             for (fid, score, image_path, H_tok, W_tok, top_patch_idx) in image_results:
