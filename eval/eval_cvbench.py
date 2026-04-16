@@ -581,9 +581,9 @@ def main():
         print_comparison(all_metrics)
 
     # ── 保存 ──
-    with open(os.path.join(args.save_dir, "summary.json"), "w") as f:
+    with open(os.path.join(args.save_dir, "summary_layer20.json"), "w") as f:
         json.dump(all_metrics, f, indent=2)
-    print(f"\nDone. Summary saved to {args.save_dir}/summary.json")
+    print(f"\nDone. Summary saved to {args.save_dir}/summary_layer20.json")
 
 
 if __name__ == "__main__":

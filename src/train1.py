@@ -4,7 +4,8 @@ SAE 训练入口。
   python -m src.train                        # 使用 CFG 默认 layers
   CUDA_VISIBILE_DEVICES=2 python -m src.train1 --layers 6 10 20                        # 自定义 layers
   python -m src.train --layers 20            # 单个 layer
-  CUDA_VISIBILE_DEVICES=2 python -m src.train1 --layers 20 && CUDA_VISIBILE_DEVICES=2 python -m src.train1 --layers 6
+  CUDA_VISIBILE_DEVICES=2 python -m src.train1 --layers 20 && CUDA_VISIBILE_DEVICES=0 python -m src.train1 --layers 10
+  CUDA_VISIBILE_DEVICES=2 python -m src.train1 --layers 4 && CUDA_VISIBLE_DEVICES=2 python scripts/build_cache_new.py --layer 4
 """
 import os
 import sys

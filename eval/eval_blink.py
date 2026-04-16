@@ -606,7 +606,7 @@ def main():
                                  "finetune_baseline", "both", "all"])
     parser.add_argument("--layer", type=int, default=CFG.vis_layer)
     parser.add_argument("--predictor_ckpt", type=str,
-                        default="outputs/focus_ckpt_0.75_64_5000/predictor_best.pt")
+                        default="outputs/focus_ckpt_layer20/predictor_best.pt")
     parser.add_argument("--qwen_ckpt", type=str, default=None,
                         help="For enhanced: Stage 2 weights. "
                              "For finetune_baseline: ablation weights.")
@@ -718,7 +718,7 @@ def main():
     if len(all_metrics) >= 2:
         print_comparison(all_metrics)
 
-    summary_path = os.path.join(args.save_dir, "summary.json")
+    summary_path = os.path.join(args.save_dir, "summary_layer20.json")
     with open(summary_path, "w") as f:
         json.dump(all_metrics, f, indent=2)
     print(f"\nDone. Summary saved to {summary_path}")

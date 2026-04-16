@@ -6,8 +6,8 @@
 
 用法：
     python src/v.py \
-        --image data/images/train2014/COCO_train2014_000000524522.jpg \
-        --question "Are all the players wearing black shirts?" \
+        --image data/images/train2014/COCO_train2014_000000524291.jpg \
+        --question "What is in the person's hand?" \
         --predictor_ckpt outputs/focus_ckpt_0.75_64_5000/predictor_best.pt --n_clusters 2
 
     python src/visualize_heatmap.py --image xxx.jpg --question "..." --n_clusters 3
@@ -238,7 +238,7 @@ def main():
     parser.add_argument("--question", type=str, required=True)
     parser.add_argument("--layer", type=int, default=CFG.vis_layer)
     parser.add_argument("--predictor_ckpt", type=str,
-                        default="outputs/focus_ckpt/predictor_best.pt")
+                        default="outputs/qwen_layer8_old/focus_ckpt_0.75_64_5000/predictor_best.pt")
     parser.add_argument("--qwen_ckpt", type=str, default=None)
     parser.add_argument("--max_tokens", type=int, default=64)
     parser.add_argument("--n_clusters", type=int, default=3,

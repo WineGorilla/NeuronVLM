@@ -3,7 +3,7 @@
 
 用法：
     python scripts/build_feature_index.py --layer 8
-    CUDA_VISIBLE_DEVICES=1 python scripts/interpreta.py --layer 8
+    CUDA_VISIBLE_DEVICES=2 python scripts/interpreta.py --layer 4
     python scripts/interpret.py --layer 8 --debug_feature 100
 """
 import os

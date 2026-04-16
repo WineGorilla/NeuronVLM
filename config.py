@@ -14,9 +14,10 @@ class Config:
 
     # 数据
     train_file: str = "data/train_vqa2_unique.jsonl"#正式版："data/train_vqa2.jsonl"
+    dataset_file: str = "data/train_vqa2.jsonl"
 
     # ── SAE 层索引（内部会 +1 以跳过 embedding 层）──────────────
-    layers: List[int] = field(default_factory=lambda: [20])
+    layers: List[int] = field(default_factory=lambda: [8])
 
     # ── SAE 超参 ──────────────────────────────────────────────
     latent_mult: int = 32      # latent_dim = hidden_dim * latent_mult
@@ -35,14 +36,14 @@ class Config:
 
     # ── 路径 ──────────────────────────────────────────────────
     save_llava_dir: str = "outputs/llava/sae_ckpt"
-    save_dir: str = "outputs/qwen/sae_ckpt"
+    save_dir: str = "outputs/qwen_layer8_old/sae_ckpt"
 
     llava_cache_dir: str = "outputs/llava_next"
     cache_dir: str = "outputs/qwen"
     label_dir: str = "assets"
 
     # ── 推理 / 可视化 
-    vis_layer: int = 20           # 可视化时使用的层
+    vis_layer: int = 8          # 可视化时使用的层
     vis_feature_id: int = 120    # 默认查看的 feature id
     top_n_patches: int = 60     # 每张图保留激活最强的 patch 数 注意llava和qwen是不一样个数的 qwen60 llava480 4倍
     top_n_images: int = 5        # 每个 feature 展示的 top-N 图片数 注意

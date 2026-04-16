@@ -9,7 +9,7 @@ Vision Token 热图可视化 — 查看模型在 SAE inject 层和 PCS suppress 
     python src/visualize_heatmap.py \
         --image data/images/train2014/COCO_train2014_000000394476.jpg \
         --question "Is the bathroom clean?" \
-        --predictor_ckpt outputs/focus_ckpt_0.75_64_5000/predictor_best.pt \
+        --predictor_ckpt outputs/qwen_layer8_old/focus_ckpt_0.75_64_5000/predictor_best.pt \
         --save_dir outputs/heatmaps
 
     # 只看 SAE 层

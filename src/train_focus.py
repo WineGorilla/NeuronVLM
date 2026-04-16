@@ -5,8 +5,8 @@ Stage 1: 学 what to focus
   - 训练 ClusterPredictor + ImageClusterScorer
   - Hook 只读：预测 cluster，不修改 hidden
   - Loss = BCE + alignment
-  - 命令: python -m src.train_focus --stage 1
-
+  - 命令: CUDA_VISIBLE_DEVICES=0 python -m src.train_focus --stage 1 && CUDA_VISIBLE_DEVICES=0 python -m src.train_focus --stage 2 --resume best
+CUDA_VISIBLE_DEVICES=1 python -m src.train_focus --stage 1 && CUDA_VISIBLE_DEVICES=1 python -m src.train_focus --stage 2 --resume best && CUDA_VISIBLE_DEVICES=1 python scripts/eval_all.py --mode enhanced --layer 4
 Stage 2: 学 how to inject
   - 训练 SemanticCrossAttention + ExtraProjector + top LM layers
   - Hook 读写：预测 cluster + 注入 extra tokens
@@ -37,7 +37,7 @@ EPOCHS         = 3
 GRAD_ACCUM     = 8
 LOG_EVERY      = 10
 SAVE_EVERY     = 500
-SAVE_DIR       = "outputs/focus_ckpt_layer20"
+SAVE_DIR       = "outputs/focus_ckpt_layer4"
 
 
 def main():

@@ -12,7 +12,7 @@ feature_index 格式：
     image_score 用 top patch 的平均激活值计算，代表该 feature 在这张图里最典型区域的强度。
 
 用法：
-    python scripts/build_feature_index.py --layer 8
+    python scripts/build_feature_index.py --layer 4 --min_images 3
     python scripts/build_feature_index.py --layer 8 --top_k 10 --min_images 3
 """
 import os
