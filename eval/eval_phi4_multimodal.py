@@ -1,17 +1,17 @@
 """
-DeepSeek-VL2 基础模型评估脚本。
+Phi-4-multimodal-instruct 评估脚本。
 
 支持 4 个 benchmark：CV-Bench, BLINK, RealWorldQA, MMStar。
-
-环境要求：
-    transformers==4.45.2
-    pip install git+https://github.com/deepseek-ai/DeepSeek-VL2.git
+使用 transformers 原生接口 + vision-lora 推理。
 
 用法：
-    CUDA_VISIBLE_DEVICES=0 python eval/eval_deepseek_vl2_base.py
-    python eval/eval_deepseek_vl2_base.py --model_id deepseek-ai/deepseek-vl2-small
-    python eval/eval_deepseek_vl2_base.py --benchmarks cvbench mmstar
-    python eval/eval_deepseek_vl2_base.py --max_samples 50
+    CUDA_VISIBLE_DEVICES=0 python eval/eval_phi4_multimodal.py
+    python eval/eval_phi4_multimodal.py --benchmarks cvbench mmstar
+    python eval/eval_phi4_multimodal.py --benchmarks blink --depth_spatial_only
+    python eval/eval_phi4_multimodal.py --max_samples 50
+
+依赖：
+    pip install transformers>=4.48.2 torch torchvision accelerate peft pillow
 """
 import os
 import sys
@@ -20,42 +20,59 @@ import json
 import argparse
 from collections import defaultdict
 
+sys.path.insert(0, os.path.dirname(os.path.dirname(__file__)))
+
 import numpy as np
 import torch
-from datasets import load_dataset
 from PIL import Image
+from datasets import load_dataset
 from tqdm import tqdm
 
-from transformers import AutoModelForCausalLM
-from deepseek_vl2.models import DeepseekVLV2Processor, DeepseekVLV2ForCausalLM
-from deepseek_vl2.utils.io import load_pil_images
 
-MODEL_ID = "deepseek-ai/deepseek-vl2-small"
+# ══════════════════════════════════════════════════════════════════════════════
+# Phi-4-multimodal-instruct 配置
+# ══════════════════════════════════════════════════════════════════════════════
+
+MODEL_ID = "microsoft/Phi-4-multimodal-instruct"
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-# 模型加载
+# 模型加载（transformers + vision-lora）
 # ══════════════════════════════════════════════════════════════════════════════
 
-def load_model(model_id):
-    print(f"Loading DeepSeek-VL2: {model_id}")
-    vl_chat_processor = DeepseekVLV2Processor.from_pretrained(model_id)
-    tokenizer = vl_chat_processor.tokenizer
+def load_phi4_multimodal():
+    from transformers import AutoModelForCausalLM, AutoProcessor, AutoConfig
 
-    vl_gpt = AutoModelForCausalLM.from_pretrained(
-        model_id,
+    print(f"Loading Phi-4-multimodal: {MODEL_ID}")
+
+    config = AutoConfig.from_pretrained(MODEL_ID, trust_remote_code=True)
+    config._attn_implementation = "eager"
+
+    processor = AutoProcessor.from_pretrained(MODEL_ID, trust_remote_code=True)
+    model = AutoModelForCausalLM.from_pretrained(
+        MODEL_ID,
+        config=config,
+        torch_dtype=torch.bfloat16,
+        device_map="auto",
         trust_remote_code=True,
+        attn_implementation="eager",
+    ).eval()
+
+    model.load_adapter(
+        MODEL_ID,
+        adapter_name="vision",
+        device_map="auto",
+        adapter_kwargs={"subfolder": "vision-lora"},
     )
-    vl_gpt = vl_gpt.to(torch.bfloat16).cuda().eval()
+    model.set_adapter("vision")
 
-    print(f"  Model type: {type(vl_gpt)}")
-    print("  Model loaded.")
-    return vl_gpt, vl_chat_processor, tokenizer
+    print("  Model loaded with vision-lora adapter.")
+    return model, processor
 
 
-def generate(vl_gpt, vl_chat_processor, tokenizer, image, question,
-             max_new_tokens=32):
-    """DeepSeek-VL2 单次推理。"""
+
+def phi4_generate(model, processor, image, question, max_new_tokens=32):
+    """Phi-4-multimodal-instruct 推理。"""
     try:
         if isinstance(image, str):
             image = Image.open(image).convert("RGB")
@@ -64,41 +81,26 @@ def generate(vl_gpt, vl_chat_processor, tokenizer, image, question,
         else:
             return ""
 
-        tmp_path = "/tmp/deepseek_vl2_eval_tmp.png"
-        image.save(tmp_path)
+        # Phi-4-multimodal 使用 <|image|> 占位符
+        prompt = f"<|user|>\n<|image_1|>\n{question}<|end|>\n<|assistant|>\n"
 
-        conversation = [
-            {
-                "role": "<|User|>",
-                "content": f"<image>\n{question}",
-                "images": [tmp_path],
-            },
-            {"role": "<|Assistant|>", "content": ""},
-        ]
+        inputs = processor(
+            text=prompt,
+            images=[image],
+            return_tensors="pt",
+        ).to(model.device)
 
-        pil_images = load_pil_images(conversation)
-        prepare_inputs = vl_chat_processor(
-            conversations=conversation,
-            images=pil_images,
-            force_batchify=True,
-            system_prompt="",
-        ).to(vl_gpt.device)
+        with torch.no_grad():
+            output_ids = model.generate(
+                **inputs,
+                max_new_tokens=max_new_tokens,
+                do_sample=False,
+            )
 
-        inputs_embeds = vl_gpt.prepare_inputs_embeds(**prepare_inputs)
-
-        outputs = vl_gpt.language.generate(
-            inputs_embeds=inputs_embeds,
-            attention_mask=prepare_inputs.attention_mask,
-            pad_token_id=tokenizer.eos_token_id,
-            bos_token_id=tokenizer.bos_token_id,
-            eos_token_id=tokenizer.eos_token_id,
-            max_new_tokens=max_new_tokens,
-            do_sample=False,
-            use_cache=True,
-        )
-
-        response = tokenizer.decode(
-            outputs[0].cpu().tolist(), skip_special_tokens=True,
+        input_len = inputs["input_ids"].shape[1]
+        response = processor.decode(
+            output_ids[0, input_len:],
+            skip_special_tokens=True,
         ).strip()
         return response
 
@@ -108,7 +110,7 @@ def generate(vl_gpt, vl_chat_processor, tokenizer, image, question,
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-# 答案匹配
+# 答案匹配工具
 # ══════════════════════════════════════════════════════════════════════════════
 
 def extract_choice_letter(response, max_letter="Z"):
@@ -132,7 +134,7 @@ def extract_choice_letter(response, max_letter="Z"):
 # CV-Bench
 # ══════════════════════════════════════════════════════════════════════════════
 
-def eval_cvbench(vl_gpt, vl_chat_processor, tokenizer, max_samples=None):
+def eval_cvbench(model, processor, max_samples=None):
     print(f"\n{'='*60}\n  CV-Bench Evaluation\n{'='*60}")
 
     ds = load_dataset("nyu-visionx/CV-Bench", split="test")
@@ -143,8 +145,7 @@ def eval_cvbench(vl_gpt, vl_chat_processor, tokenizer, max_samples=None):
     results = []
     for item in tqdm(ds, desc="CV-Bench"):
         choices = item["choices"]
-        choice_text = "\n".join(
-            [f"{chr(ord('A')+i)}. {c}" for i, c in enumerate(choices)])
+        choice_text = "\n".join([f"{chr(ord('A')+i)}. {c}" for i, c in enumerate(choices)])
         prompt = (
             "Answer the following question.\n"
             "Select the correct option and output ONLY the letter.\n"
@@ -152,8 +153,7 @@ def eval_cvbench(vl_gpt, vl_chat_processor, tokenizer, max_samples=None):
             f"{item['prompt']}\n\nChoices:\n{choice_text}\n\nAnswer:"
         )
 
-        response = generate(vl_gpt, vl_chat_processor, tokenizer,
-                            item["image"], prompt)
+        response = phi4_generate(model, processor, item["image"], prompt)
         extracted = extract_choice_letter(response)
         answer = item["answer"]
         extracted_fmt = f"({extracted})" if extracted else None
@@ -186,6 +186,7 @@ def eval_cvbench(vl_gpt, vl_chat_processor, tokenizer, max_samples=None):
     print(f"\n  CV-Bench Overall : {cv_bench:.2f}")
     print(f"  2D Accuracy      : {acc_2d:.2f}  (ADE={acc_ade:.2f}, COCO={acc_coco:.2f})")
     print(f"  3D Accuracy      : {acc_3d:.2f}  (Omni3D={acc_omni:.2f})")
+    print(f"  Per-Task:")
     for t in sorted(by_task.keys()):
         print(f"    {t:20s}: {acc(by_task[t]):6.2f}  (n={len(by_task[t])})")
     print(f"  Unparsed: {n_unparsed}/{len(results)}")
@@ -202,7 +203,7 @@ def eval_cvbench(vl_gpt, vl_chat_processor, tokenizer, max_samples=None):
 # MMStar
 # ══════════════════════════════════════════════════════════════════════════════
 
-def eval_mmstar(vl_gpt, vl_chat_processor, tokenizer, max_samples=None):
+def eval_mmstar(model, processor, max_samples=None):
     print(f"\n{'='*60}\n  MMStar Evaluation\n{'='*60}")
 
     ds = load_dataset("Lin-Chen/MMStar", split="val")
@@ -219,8 +220,7 @@ def eval_mmstar(vl_gpt, vl_chat_processor, tokenizer, max_samples=None):
             f"{item['question']}\n\nAnswer:"
         )
 
-        response = generate(vl_gpt, vl_chat_processor, tokenizer,
-                            item["image"], prompt)
+        response = phi4_generate(model, processor, item["image"], prompt)
         extracted = extract_choice_letter(response, max_letter="D")
         answer = item["answer"].strip().upper()
         correct = extracted == answer
@@ -243,6 +243,7 @@ def eval_mmstar(vl_gpt, vl_chat_processor, tokenizer, max_samples=None):
     n_unparsed = sum(1 for r in results if r["extracted"] is None)
 
     print(f"\n  Overall Accuracy : {overall:.2f}  (n={len(results)})")
+    print(f"  Per Category:")
     cat_accs = {}
     for cat in sorted(by_category.keys()):
         a = acc(by_category[cat])
@@ -300,7 +301,7 @@ def match_realworldqa(response, answer, q_type):
     return False, resp
 
 
-def eval_realworldqa(vl_gpt, vl_chat_processor, tokenizer, max_samples=None):
+def eval_realworldqa(model, processor, max_samples=None):
     print(f"\n{'='*60}\n  RealWorldQA Evaluation\n{'='*60}")
 
     ds = load_dataset("xai-org/RealworldQA", split="test")
@@ -314,8 +315,7 @@ def eval_realworldqa(vl_gpt, vl_chat_processor, tokenizer, max_samples=None):
         answer = item["answer"]
         q_type = detect_question_type(question, answer)
 
-        response = generate(vl_gpt, vl_chat_processor, tokenizer,
-                            item["image"], question)
+        response = phi4_generate(model, processor, item["image"], question)
         correct, extracted = match_realworldqa(response, answer, q_type)
 
         results.append({
@@ -331,10 +331,10 @@ def eval_realworldqa(vl_gpt, vl_chat_processor, tokenizer, max_samples=None):
         return sum(1 for i in items if i["correct"]) / len(items) * 100 if items else 0
 
     overall = acc(results)
-    n_unparsed = sum(
-        1 for r in results if r.get("extracted") is None and r["q_type"] == "mcq")
+    n_unparsed = sum(1 for r in results if r.get("extracted") is None and r["q_type"] == "mcq")
 
     print(f"\n  Overall Accuracy : {overall:.2f}  (n={len(results)})")
+    print(f"  Per Type:")
     per_type = {}
     for t in ["mcq", "yes_no", "short"]:
         if t in by_type:
@@ -377,8 +377,7 @@ def concat_images_horizontal(image_paths, max_height=768):
     resized = []
     for img in images:
         ratio = target_h / img.height
-        resized.append(
-            img.resize((int(img.width * ratio), target_h), Image.LANCZOS))
+        resized.append(img.resize((int(img.width * ratio), target_h), Image.LANCZOS))
     total_w = sum(img.width for img in resized)
     concat = Image.new("RGB", (total_w, target_h))
     x = 0
@@ -390,8 +389,7 @@ def concat_images_horizontal(image_paths, max_height=768):
     return out
 
 
-def eval_blink(vl_gpt, vl_chat_processor, tokenizer, subtasks=None,
-               max_samples=None):
+def eval_blink(model, processor, subtasks=None, max_samples=None):
     print(f"\n{'='*60}\n  BLINK Evaluation\n{'='*60}")
 
     if subtasks is None:
@@ -442,11 +440,12 @@ def eval_blink(vl_gpt, vl_chat_processor, tokenizer, subtasks=None,
         )
         if has_image_choices:
             choice_text = "\n".join(
-                [f"{chr(ord('A')+i)}. (Image {i+1})"
-                 for i in range(len(choices))])
+                [f"{chr(ord('A')+i)}. (Image {i+1})" for i in range(len(choices))]
+            )
         else:
             choice_text = "\n".join(
-                [f"{chr(ord('A')+i)}. {c}" for i, c in enumerate(choices)])
+                [f"{chr(ord('A')+i)}. {c}" for i, c in enumerate(choices)]
+            )
         prompt_text = (
             "Answer the following question.\n"
             "Select the correct option and output ONLY the letter.\n"
@@ -473,8 +472,7 @@ def eval_blink(vl_gpt, vl_chat_processor, tokenizer, subtasks=None,
             continue
 
         concat_path = concat_images_horizontal(image_paths)
-        response = generate(vl_gpt, vl_chat_processor, tokenizer,
-                            concat_path, prompt_text)
+        response = phi4_generate(model, processor, concat_path, prompt_text)
 
         extracted = extract_choice_letter(response)
         answer = item["answer"]
@@ -496,22 +494,19 @@ def eval_blink(vl_gpt, vl_chat_processor, tokenizer, subtasks=None,
 
     per_subtask = {t: acc(by_subtask[t]) for t in sorted(by_subtask.keys())}
     overall = sum(per_subtask.values()) / len(per_subtask) if per_subtask else 0
-    ds_items = [r for t in DEPTH_SPATIAL_SUBTASKS
-                for r in by_subtask.get(t, [])]
+    ds_items = [r for t in DEPTH_SPATIAL_SUBTASKS for r in by_subtask.get(t, [])]
     acc_ds = acc(ds_items)
-    other_items = [r for t in by_subtask
-                   if t not in DEPTH_SPATIAL_SUBTASKS
-                   for r in by_subtask[t]]
+    other_items = [r for t in by_subtask if t not in DEPTH_SPATIAL_SUBTASKS for r in by_subtask[t]]
     acc_other = acc(other_items)
     n_unparsed = sum(1 for r in results if r["extracted"] is None)
 
     print(f"\n  BLINK Overall (macro) : {overall:.2f}")
     print(f"  Depth/Spatial         : {acc_ds:.2f}  (n={len(ds_items)})")
     print(f"  Other Tasks           : {acc_other:.2f}  (n={len(other_items)})")
+    print(f"  Per-Subtask:")
     for t in sorted(by_subtask.keys()):
         marker = " *" if t in DEPTH_SPATIAL_SUBTASKS else ""
-        print(f"    {t:30s}: {acc(by_subtask[t]):6.2f}  "
-              f"(n={len(by_subtask[t])}){marker}")
+        print(f"    {t:30s}: {acc(by_subtask[t]):6.2f}  (n={len(by_subtask[t])}){marker}")
     print(f"  Unparsed: {n_unparsed}/{len(results)}")
 
     return {
@@ -527,43 +522,41 @@ def eval_blink(vl_gpt, vl_chat_processor, tokenizer, subtasks=None,
 # ══════════════════════════════════════════════════════════════════════════════
 
 def main():
-    parser = argparse.ArgumentParser(
-        description="DeepSeek-VL2 Base Evaluation")
+    global MODEL_ID
+
+    parser = argparse.ArgumentParser(description="Phi-4-multimodal-instruct Evaluation")
     parser.add_argument("--benchmarks", type=str, nargs="+",
                         default=["cvbench", "mmstar", "realworldqa", "blink"],
                         choices=["cvbench", "mmstar", "realworldqa", "blink"])
     parser.add_argument("--max_samples", type=int, default=None)
-    parser.add_argument("--save_dir", type=str,
-                        default="outputs/deepseek_vl2_base_results")
-    parser.add_argument("--model_id", type=str, default=MODEL_ID)
+    parser.add_argument("--save_dir", type=str, default="outputs/phi4_multimodal_results")
+    parser.add_argument("--model_id", type=str, default=MODEL_ID,
+                        help="Phi-4-multimodal model ID")
     parser.add_argument("--blink_subtasks", type=str, nargs="+", default=None)
     parser.add_argument("--depth_spatial_only", action="store_true")
     args = parser.parse_args()
+    MODEL_ID = args.model_id
 
-    model_id = args.model_id
     os.makedirs(args.save_dir, exist_ok=True)
 
-    vl_gpt, vl_chat_processor, tokenizer = load_model(model_id)
+    model, processor = load_phi4_multimodal()
 
     all_summary = {}
 
     if "cvbench" in args.benchmarks:
-        metrics, results = eval_cvbench(
-            vl_gpt, vl_chat_processor, tokenizer, args.max_samples)
+        metrics, results = eval_cvbench(model, processor, args.max_samples)
         all_summary["cvbench"] = metrics
         with open(os.path.join(args.save_dir, "cvbench_results.json"), "w") as f:
             json.dump(results, f, indent=2, ensure_ascii=False)
 
     if "mmstar" in args.benchmarks:
-        metrics, results = eval_mmstar(
-            vl_gpt, vl_chat_processor, tokenizer, args.max_samples)
+        metrics, results = eval_mmstar(model, processor, args.max_samples)
         all_summary["mmstar"] = metrics
         with open(os.path.join(args.save_dir, "mmstar_results.json"), "w") as f:
             json.dump(results, f, indent=2, ensure_ascii=False)
 
     if "realworldqa" in args.benchmarks:
-        metrics, results = eval_realworldqa(
-            vl_gpt, vl_chat_processor, tokenizer, args.max_samples)
+        metrics, results = eval_realworldqa(model, processor, args.max_samples)
         all_summary["realworldqa"] = metrics
         with open(os.path.join(args.save_dir, "realworldqa_results.json"), "w") as f:
             json.dump(results, f, indent=2, ensure_ascii=False)
@@ -572,14 +565,13 @@ def main():
         subtasks = args.blink_subtasks
         if args.depth_spatial_only:
             subtasks = DEPTH_SPATIAL_SUBTASKS
-        metrics, results = eval_blink(
-            vl_gpt, vl_chat_processor, tokenizer, subtasks, args.max_samples)
+        metrics, results = eval_blink(model, processor, subtasks, args.max_samples)
         all_summary["blink"] = metrics
         with open(os.path.join(args.save_dir, "blink_results.json"), "w") as f:
             json.dump(results, f, indent=2, ensure_ascii=False)
 
     print(f"\n{'='*60}")
-    print(f"  DeepSeek-VL2 Base — Summary")
+    print(f"  Phi-4-multimodal-instruct — Summary")
     print(f"{'='*60}")
     for name, m in all_summary.items():
         key = "cv_bench" if name == "cvbench" else "overall"
