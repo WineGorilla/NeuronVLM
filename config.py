@@ -28,7 +28,7 @@ class Config:
     sae_epochs:    int   = 1
     epochs:        int   = 2
     lr:            float = 1e-4   # 归一化去掉后可以稍大
-    sparsity_coef: float = 0.03 #原本是0.05
+    sparsity_coef: float = 0.05 #原本是0.05
     grad_accum:    int   = 6
     save_every: int = 5000   # 每 N 个 optimizer step 保存一次
 

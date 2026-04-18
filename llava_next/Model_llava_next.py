@@ -740,7 +740,7 @@ class LlavaNextWithClusterPredictorAndSAE(nn.Module):
         sae.load_state_dict(torch.load(
             os.path.join(sae_ckpt_dir, f"sae_layer{inject_layer}.pt"),
             map_location=device,
-        ))
+        ), strict=False)
 
         with open(cluster_path) as f:
             cluster_info = json.load(f)

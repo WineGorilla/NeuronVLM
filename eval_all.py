@@ -5,10 +5,10 @@
 
 用法：
     # 全部 benchmark + base vs enhanced
-    python scripts/eval_all.py --mode enhanced --layer 8
-
+    python scripts/eval_all.py --mode enhanced --layer 8 --no_pcs --benchmarks cvbench blink --num_runs 3 --subsample_ratio 0.8
+    python eval_all.py --mode no_pcs --layer 8 --benchmarks cvbench blink --num_runs 3 --subsample_ratio 0.8
     # 只跑指定 benchmark
-    python eval/eval_all.py --mode both --benchmarks cvbench mmstar
+    python eval/eval_all.py --mode both --benchmarks cvbench blink
 
     # 全部模型对比
     python eval/eval_all.py --mode all --qwen_ckpt outputs/ablation_baseline/qwen_best.pt
@@ -21,16 +21,24 @@
 
     # 指定 spatial 权重
     python eval/eval_all.py --mode spatial --spatial_qwen_ckpt outputs/focus_v2_ckpt/qwen_best.pt
+
+    # 跑3次，报告 mean±std（每次随机采样80%数据）
+    python eval_all.py --mode both --num_runs 3 --subsample_ratio 0.8
+
+    # 跑5次，采样90%
+    python eval/eval_all.py --mode both --num_runs 5 --subsample_ratio 0.9
 """
 import os
 import sys
 import re
 import json
+import random
 import argparse
 from collections import defaultdict
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(__file__)))
 
+import numpy as np
 import torch
 from datasets import load_dataset
 from PIL import Image
@@ -107,6 +115,18 @@ def concat_images_horizontal(image_paths: list, max_height: int = 768) -> str:
     out = "/tmp/eval_all_concat.png"
     concat.save(out)
     return out
+
+
+def subsample(ds, ratio, seed, is_list=False):
+    """从 dataset 中随机采样 ratio 比例的数据，用于 bootstrap 多次评估。"""
+    random.seed(seed)
+    n = len(ds)
+    k = int(n * ratio)
+    indices = random.sample(range(n), k)
+    if is_list:
+        return [ds[i] for i in indices]
+    else:
+        return ds.select(indices)
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -727,6 +747,83 @@ def print_grand_summary(all_results: dict, model_labels: list):
     print(f"{'═'*75}")
 
 
+def aggregate_multi_runs(all_runs_results: list, model_labels: list):
+    """
+    all_runs_results: list of {benchmark: {model_label: metrics_dict}}
+    返回: {benchmark: {model_label: {metric: {"mean": x, "std": x, "runs": [...]}}}}
+    """
+    benchmarks = set()
+    for run in all_runs_results:
+        benchmarks.update(run.keys())
+
+    aggregated = {}
+    for bench in benchmarks:
+        aggregated[bench] = {}
+        for ml in model_labels:
+            # 收集每次 run 的 metrics
+            all_metrics = [run[bench][ml] for run in all_runs_results
+                           if bench in run and ml in run[bench]]
+            if not all_metrics:
+                continue
+            # 提取所有数值型 key
+            agg = {}
+            for key in all_metrics[0]:
+                vals = [m[key] for m in all_metrics if key in m]
+                if vals and isinstance(vals[0], (int, float)):
+                    agg[key] = {
+                        "mean": float(np.mean(vals)),
+                        "std": float(np.std(vals)),
+                        "runs": [float(v) for v in vals],
+                    }
+            aggregated[bench][ml] = agg
+    return aggregated
+
+
+def print_grand_summary_with_std(aggregated: dict, model_labels: list):
+    print(f"\n{'═'*85}")
+    print(f"  Grand Summary (mean ± std) — All Benchmarks × All Models")
+    print(f"{'═'*85}")
+
+    header = f"  {'Benchmark / Metric':<30s}"
+    for ml in model_labels:
+        header += f" {ml:>18s}"
+    if len(model_labels) >= 2:
+        header += f"  {'Delta':>10s}"
+    print(header)
+    print(f"  {'─'*80}")
+
+    bench_keys = [
+        ("CV-Bench",        "cvbench",     "cv_bench"),
+        ("  2D",            "cvbench",     "acc_2d"),
+        ("  3D",            "cvbench",     "acc_3d"),
+        ("MMStar",          "mmstar",      "overall"),
+        ("RealWorldQA",     "realworldqa", "overall"),
+        ("BLINK Overall",   "blink",       "overall"),
+        ("  Depth/Spatial", "blink",       "acc_depth_spatial"),
+        ("  Other",         "blink",       "acc_other"),
+    ]
+
+    for name, bench, key in bench_keys:
+        if bench not in aggregated:
+            continue
+        line = f"  {name:<30s}"
+        means = []
+        for ml in model_labels:
+            stats = aggregated.get(bench, {}).get(ml, {}).get(key, None)
+            if stats:
+                line += f" {stats['mean']:6.2f}±{stats['std']:4.2f}   "
+                means.append(stats["mean"])
+            else:
+                line += f" {'N/A':>18s}"
+                means.append(None)
+        if len(means) >= 2 and means[0] is not None and means[-1] is not None:
+            d = means[-1] - means[0]
+            line += f"  {'+'if d>0 else ''}{d:7.2f}"
+        print(line)
+
+    print(f"{'═'*85}")
+
+
 # ══════════════════════════════════════════════════════════════════════════════
 # 单个模型跑所有 benchmark
 # ══════════════════════════════════════════════════════════════════════════════
@@ -824,11 +921,16 @@ def main():
                         default="outputs/focus_ckpt_spatial/predictor_best.pt")
     parser.add_argument("--spatial_qwen_ckpt", type=str, default=None)
     parser.add_argument("--no_pcs_predictor_ckpt", type=str,
-                        default="outputs/ablation_no_pcs/predictor_best.pt")
+                        default="outputs/evaluation/ablation_no_pcs/predictor_best.pt")
     parser.add_argument("--no_pcs_qwen_ckpt", type=str, default=None)
     # BLINK 特有
     parser.add_argument("--blink_subtasks", type=str, nargs="+", default=None)
     parser.add_argument("--depth_spatial_only", action="store_true")
+    # 多次运行
+    parser.add_argument("--num_runs", type=int, default=1,
+                        help="重复跑几次，报告 mean±std（每次随机采样子集）")
+    parser.add_argument("--subsample_ratio", type=float, default=0.8,
+                        help="每次 run 采样数据的比例（默认 0.8 即 80%%）")
     # 通用
     parser.add_argument("--save_dir", type=str, default="outputs/eval_all_results")
     parser.add_argument("--max_samples", type=int, default=None)
@@ -843,17 +945,17 @@ def main():
     run_enhanced = args.mode in ["enhanced", "both", "all"]
     run_spatial  = args.mode in ["spatial", "all"]
 
-    # ── 加载数据集（只加载一次，所有模型共用） ──
-    datasets = {}
+    # ── 加载完整数据集（只加载一次，所有模型和所有 run 共用） ──
+    datasets_full = {}
 
     if "cvbench" in args.benchmarks:
-        datasets["cvbench"] = load_cvbench(args.max_samples)
+        datasets_full["cvbench"] = load_cvbench(args.max_samples)
 
     if "mmstar" in args.benchmarks:
-        datasets["mmstar"] = load_mmstar(args.max_samples)
+        datasets_full["mmstar"] = load_mmstar(args.max_samples)
 
     if "realworldqa" in args.benchmarks:
-        datasets["realworldqa"] = load_realworldqa(args.max_samples)
+        datasets_full["realworldqa"] = load_realworldqa(args.max_samples)
 
     if "blink" in args.benchmarks:
         blink_subtasks = args.blink_subtasks
@@ -861,86 +963,139 @@ def main():
             blink_subtasks = DEPTH_SPATIAL_SUBTASKS
         if blink_subtasks is None:
             blink_subtasks = ALL_BLINK_SUBTASKS
-        datasets["blink"] = load_blink(blink_subtasks, args.max_samples)
+        datasets_full["blink"] = load_blink(blink_subtasks, args.max_samples)
 
-    # ── 存放所有结果: {benchmark: {model_label: metrics}} ──
-    all_results = defaultdict(dict)
-    model_labels = []
+    # ── 预加载所有需要的模型（避免每次 run 重复加载） ──
+    base_model, processor = None, None
+    ft_model, ft_proc = None, None
+    no_pcs_model = None
+    enhanced_model = None
+    spatial_model = None
 
-    # ── 1. Base ──
     if run_base:
-        label = "base"
-        model_labels.append(label)
         base_model, processor = load_base_model()
-        metrics = run_all_benchmarks_base(
-            base_model, processor, datasets, label, args.save_dir)
-        for bench, m in metrics.items():
-            all_results[bench][label] = m
-        del base_model, processor
-        torch.cuda.empty_cache()
-
-    # ── 2. Finetune Baseline ──
     if run_ft_base:
-        label = "ft_baseline"
-        model_labels.append(label)
         ft_ckpt = args.baseline_ckpt or args.qwen_ckpt
         ft_model, ft_proc = load_finetune_baseline(ft_ckpt)
-        metrics = run_all_benchmarks_base(
-            ft_model, ft_proc, datasets, label, args.save_dir)
-        for bench, m in metrics.items():
-            all_results[bench][label] = m
-        del ft_model, ft_proc
-        torch.cuda.empty_cache()
-
-    # ── 3. No-PCS Ablation ──
     if run_no_pcs:
-        label = "no_pcs"
-        model_labels.append(label)
         no_pcs_model = load_enhanced_model_no_pcs(args)
-        metrics = run_all_benchmarks_enhanced(
-            no_pcs_model, datasets, label, args.save_dir)
-        for bench, m in metrics.items():
-            all_results[bench][label] = m
-        del no_pcs_model
-        torch.cuda.empty_cache()
-
-    # ── 4. Enhanced (v1) ──
     if run_enhanced:
-        label = "enhanced"
-        model_labels.append(label)
         enhanced_model = load_enhanced_model(args)
-        metrics = run_all_benchmarks_enhanced(
-            enhanced_model, datasets, label, args.save_dir)
-        for bench, m in metrics.items():
-            all_results[bench][label] = m
-        del enhanced_model
-        torch.cuda.empty_cache()
-
-    # ── 5. Spatial (v2) ──
     if run_spatial:
-        label = "spatial"
-        model_labels.append(label)
         spatial_model = load_spatial_model(args)
-        metrics = run_all_benchmarks_enhanced(
-            spatial_model, datasets, label, args.save_dir)
-        for bench, m in metrics.items():
-            all_results[bench][label] = m
-        del spatial_model
-        torch.cuda.empty_cache()
 
-    # ── 打印总结 ──
-    if len(model_labels) >= 2:
-        print_grand_summary(dict(all_results), model_labels)
+    # ── 多次运行循环 ──
+    all_runs_results = []
+    model_labels = []
 
-    # ── 保存汇总 ──
-    summary = {
-        bench: {ml: metrics for ml, metrics in model_metrics.items()}
-        for bench, model_metrics in all_results.items()
-    }
-    summary_path = os.path.join(args.save_dir, "summary_layer4.json")
-    with open(summary_path, "w") as f:
-        json.dump(summary, f, indent=2)
-    print(f"\nDone. Summary saved to {summary_path}")
+    for run_idx in range(args.num_runs):
+        if args.num_runs > 1:
+            print(f"\n{'▶'*30} Run {run_idx+1}/{args.num_runs} "
+                  f"(seed={42+run_idx}, ratio={args.subsample_ratio}) {'◀'*30}\n")
+
+        run_save_dir = (os.path.join(args.save_dir, f"run_{run_idx}")
+                        if args.num_runs > 1 else args.save_dir)
+        os.makedirs(run_save_dir, exist_ok=True)
+
+        # ── 对数据集做随机子采样 ──
+        seed = 42 + run_idx
+        if args.num_runs > 1:
+            datasets = {}
+            for key, ds in datasets_full.items():
+                datasets[key] = subsample(
+                    ds, ratio=args.subsample_ratio, seed=seed,
+                    is_list=(key == "blink"),
+                )
+                print(f"  Run {run_idx+1}: {key} sampled "
+                      f"{len(datasets[key])}/{len(ds)} (seed={seed})")
+        else:
+            datasets = datasets_full
+
+        run_results = defaultdict(dict)
+        model_labels_this_run = []
+
+        # ── 1. Base ──
+        if run_base:
+            label = "base"
+            model_labels_this_run.append(label)
+            metrics = run_all_benchmarks_base(
+                base_model, processor, datasets, label, run_save_dir)
+            for bench, m in metrics.items():
+                run_results[bench][label] = m
+
+        # ── 2. Finetune Baseline ──
+        if run_ft_base:
+            label = "ft_baseline"
+            model_labels_this_run.append(label)
+            metrics = run_all_benchmarks_base(
+                ft_model, ft_proc, datasets, label, run_save_dir)
+            for bench, m in metrics.items():
+                run_results[bench][label] = m
+
+        # ── 3. No-PCS Ablation ──
+        if run_no_pcs:
+            label = "no_pcs"
+            model_labels_this_run.append(label)
+            metrics = run_all_benchmarks_enhanced(
+                no_pcs_model, datasets, label, run_save_dir)
+            for bench, m in metrics.items():
+                run_results[bench][label] = m
+
+        # ── 4. Enhanced (v1) ──
+        if run_enhanced:
+            label = "enhanced"
+            model_labels_this_run.append(label)
+            metrics = run_all_benchmarks_enhanced(
+                enhanced_model, datasets, label, run_save_dir)
+            for bench, m in metrics.items():
+                run_results[bench][label] = m
+
+        # ── 5. Spatial (v2) ──
+        if run_spatial:
+            label = "spatial"
+            model_labels_this_run.append(label)
+            metrics = run_all_benchmarks_enhanced(
+                spatial_model, datasets, label, run_save_dir)
+            for bench, m in metrics.items():
+                run_results[bench][label] = m
+
+        all_runs_results.append(dict(run_results))
+        model_labels = model_labels_this_run  # 每次 run 的 label 相同
+
+        # 单次打印
+        if len(model_labels) >= 2:
+            print_grand_summary(dict(run_results), model_labels)
+
+    # ── 释放模型显存 ──
+    del base_model, processor, ft_model, ft_proc
+    del no_pcs_model, enhanced_model, spatial_model
+    torch.cuda.empty_cache()
+
+    # ── 多次运行汇总 ──
+    if args.num_runs > 1:
+        aggregated = aggregate_multi_runs(all_runs_results, model_labels)
+        print_grand_summary_with_std(aggregated, model_labels)
+
+        # 保存汇总
+        summary = {
+            "config": {
+                "num_runs": args.num_runs,
+                "subsample_ratio": args.subsample_ratio,
+                "seeds": [42 + i for i in range(args.num_runs)],
+            },
+            "aggregated": aggregated,
+            "per_run": all_runs_results,
+        }
+        summary_path = os.path.join(args.save_dir, "summary_mean_std.json")
+        with open(summary_path, "w") as f:
+            json.dump(summary, f, indent=2)
+        print(f"\nDone. Aggregated summary (mean±std) saved to {summary_path}")
+    else:
+        summary = all_runs_results[0]
+        summary_path = os.path.join(args.save_dir, "summary.json")
+        with open(summary_path, "w") as f:
+            json.dump(summary, f, indent=2)
+        print(f"\nDone. Summary saved to {summary_path}")
 
 
 if __name__ == "__main__":

@@ -1,105 +1,64 @@
 """
-DeepSeek-VL 基础模型评估脚本。
+MiniCPM-V 2.6 基础模型评估脚本。
 
 支持 4 个 benchmark：CV-Bench, BLINK, RealWorldQA, MMStar。
-只测原始模型（无 hook / 无增强），用于获取 baseline 分数。
-
-依赖安装（自动尝试，也可手动）：
-    pip install git+https://github.com/deepseek-ai/DeepSeek-VL.git
+使用 MiniCPM-V 2.6 自带的 model.chat() 接口推理。
 
 用法：
-    CUDA_VISIBLE_DEVICES=2 python eval/eval_deepseek_vl_base.py
-    python eval/eval_deepseek_vl_base.py --benchmarks cvbench mmstar
-    python eval/eval_deepseek_vl_base.py --benchmarks blink --depth_spatial_only
-    python eval/eval_deepseek_vl_base.py --max_samples 50
-    python eval/eval_deepseek_vl_base.py --model_id deepseek-ai/deepseek-vl-1.3b-chat
+    CUDA_VISIBLE_DEVICES=0 python eval/eval_minicpmv26.py
+    python eval/eval_minicpmv26.py --benchmarks cvbench mmstar
+    python eval/eval_minicpmv26.py --benchmarks blink --depth_spatial_only
+    python eval/eval_minicpmv26.py --max_samples 50
+
+依赖：
+    pip install transformers==4.40.0 torchvision sentencepiece decord pillow
 """
 import os
 import sys
 import re
 import json
 import argparse
-import subprocess
 from collections import defaultdict
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(__file__)))
 
-# ── 自动安装 deepseek_vl 依赖 ──
-try:
-    import deepseek_vl
-except ImportError:
-    print("deepseek_vl not found, installing from GitHub...")
-    subprocess.check_call([
-        sys.executable, "-m", "pip", "install",
-        "git+https://github.com/deepseek-ai/DeepSeek-VL.git",
-        "--quiet",
-    ])
-    import deepseek_vl
-
+import numpy as np
 import torch
-from datasets import load_dataset
 from PIL import Image
+from datasets import load_dataset
 from tqdm import tqdm
 
-MODEL_ID = "deepseek-ai/deepseek-vl-7b-chat"
+
+# ══════════════════════════════════════════════════════════════════════════════
+# MiniCPM-V 2.6 配置
+# ══════════════════════════════════════════════════════════════════════════════
+
+MODEL_ID = "openbmb/MiniCPM-V-2_6"
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-# 模型加载
+# 模型加载（MiniCPM-V 2.6 原生 transformers 接口）
 # ══════════════════════════════════════════════════════════════════════════════
 
-def load_model():
-    from transformers import AutoModelForCausalLM
-    from deepseek_vl.models import VLChatProcessor, MultiModalityCausalLM
+def load_minicpmv():
+    from transformers import AutoModel, AutoTokenizer
 
-    print(f"Loading DeepSeek-VL: {MODEL_ID}")
-    vl_chat_processor = VLChatProcessor.from_pretrained(MODEL_ID)
-    tokenizer = vl_chat_processor.tokenizer
-
-    # ── patch 1: 修复 siglip_vit 中 meta tensor 兼容性问题 ──
-    import deepseek_vl.models.siglip_vit as siglip_vit
-    _orig_vit_init = siglip_vit.VisionTransformer.__init__
-
-    def _patched_vit_init(self, *args, **kwargs):
-        import torch as _torch
-        _orig_linspace = _torch.linspace
-        def _cpu_linspace(*a, **kw):
-            kw.pop("device", None)
-            return _orig_linspace(*a, **kw, device="cpu")
-        _torch.linspace = _cpu_linspace
-        try:
-            _orig_vit_init(self, *args, **kwargs)
-        finally:
-            _torch.linspace = _orig_linspace
-
-    siglip_vit.VisionTransformer.__init__ = _patched_vit_init
-
-    # ── patch 2: 修复 all_tied_weights_keys 缺失问题 ──
-    if not hasattr(MultiModalityCausalLM, 'all_tied_weights_keys'):
-        @property
-        def _all_tied_weights_keys(self):
-            return {}
-        MultiModalityCausalLM.all_tied_weights_keys = _all_tied_weights_keys
-
-    model = AutoModelForCausalLM.from_pretrained(
+    print(f"Loading MiniCPM-V: {MODEL_ID}")
+    model = AutoModel.from_pretrained(
         MODEL_ID,
         trust_remote_code=True,
-        low_cpu_mem_usage=False,
-        device_map=None,
+        attn_implementation="sdpa",
+        torch_dtype=torch.bfloat16,
     )
-    model = model.to(torch.bfloat16).cuda().eval()
-
-    siglip_vit.VisionTransformer.__init__ = _orig_vit_init
-
+    model = model.eval().cuda()
+    tokenizer = AutoTokenizer.from_pretrained(MODEL_ID, trust_remote_code=True)
     print("  Model loaded.")
-    return model, vl_chat_processor, tokenizer
+    return model, tokenizer
 
 
-def deepseek_vl_generate(model, vl_chat_processor, tokenizer, image, question,
-                          max_new_tokens=32):
-    """DeepSeek-VL 单次推理。"""
+def minicpmv_generate(model, tokenizer, image, question, max_new_tokens=32):
+    """MiniCPM-V 2.6 推理，使用 model.chat() 接口。"""
     try:
-        # 处理图片输入
         if isinstance(image, str):
             image = Image.open(image).convert("RGB")
         elif isinstance(image, Image.Image):
@@ -107,48 +66,19 @@ def deepseek_vl_generate(model, vl_chat_processor, tokenizer, image, question,
         else:
             return ""
 
-        # 保存临时图片（VLChatProcessor 需要图片路径）
-        tmp_path = "/tmp/deepseek_vl_eval_tmp.png"
-        image.save(tmp_path)
+        msgs = [{"role": "user", "content": [image, question]}]
 
-        # 构造对话
-        conversation = [
-            {
-                "role": "User",
-                "content": f"<image_placeholder>{question}",
-                "images": [tmp_path],
-            },
-            {"role": "Assistant", "content": ""},
-        ]
-
-        # 加载并处理图片
-        from deepseek_vl.utils.io import load_pil_images
-        pil_images = load_pil_images(conversation)
-        prepare_inputs = vl_chat_processor(
-            conversations=conversation,
-            images=pil_images,
-            force_batchify=True,
-        ).to(model.device)
-
-        # 获取 image embeddings
-        inputs_embeds = model.prepare_inputs_embeds(**prepare_inputs)
-
-        # 生成回答
-        outputs = model.language_model.generate(
-            inputs_embeds=inputs_embeds,
-            attention_mask=prepare_inputs.attention_mask,
-            pad_token_id=tokenizer.eos_token_id,
-            bos_token_id=tokenizer.bos_token_id,
-            eos_token_id=tokenizer.eos_token_id,
+        response = model.chat(
+            image=None,
+            msgs=msgs,
+            tokenizer=tokenizer,
+            sampling=False,
             max_new_tokens=max_new_tokens,
-            do_sample=False,
-            use_cache=True,
         )
 
-        response = tokenizer.decode(
-            outputs[0].cpu().tolist(), skip_special_tokens=True,
-        ).strip()
-        return response
+        if isinstance(response, str):
+            return response.strip()
+        return str(response).strip()
 
     except Exception as e:
         print(f"  [error] generate failed: {e}")
@@ -156,7 +86,7 @@ def deepseek_vl_generate(model, vl_chat_processor, tokenizer, image, question,
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-# 答案匹配
+# 答案匹配工具
 # ══════════════════════════════════════════════════════════════════════════════
 
 def extract_choice_letter(response, max_letter="Z"):
@@ -165,11 +95,14 @@ def extract_choice_letter(response, max_letter="Z"):
         return None
     pat = f'[A-{max_letter}]'
     m = re.search(rf'\(({pat})\)', text)
-    if m: return m.group(1)
+    if m:
+        return m.group(1)
     m = re.search(rf'(?:ANSWER|OPTION)\s*(?:IS|:)?\s*\(?({pat})\)?', text)
-    if m: return m.group(1)
+    if m:
+        return m.group(1)
     m = re.match(rf'^({pat})(?:[\s.,):]|$)', text)
-    if m: return m.group(1)
+    if m:
+        return m.group(1)
     return None
 
 
@@ -177,7 +110,7 @@ def extract_choice_letter(response, max_letter="Z"):
 # CV-Bench
 # ══════════════════════════════════════════════════════════════════════════════
 
-def eval_cvbench(model, vl_chat_processor, tokenizer, max_samples=None):
+def eval_cvbench(model, tokenizer, max_samples=None):
     print(f"\n{'='*60}\n  CV-Bench Evaluation\n{'='*60}")
 
     ds = load_dataset("nyu-visionx/CV-Bench", split="test")
@@ -196,8 +129,7 @@ def eval_cvbench(model, vl_chat_processor, tokenizer, max_samples=None):
             f"{item['prompt']}\n\nChoices:\n{choice_text}\n\nAnswer:"
         )
 
-        response = deepseek_vl_generate(
-            model, vl_chat_processor, tokenizer, item["image"], prompt)
+        response = minicpmv_generate(model, tokenizer, item["image"], prompt)
         extracted = extract_choice_letter(response)
         answer = item["answer"]
         extracted_fmt = f"({extracted})" if extracted else None
@@ -230,6 +162,7 @@ def eval_cvbench(model, vl_chat_processor, tokenizer, max_samples=None):
     print(f"\n  CV-Bench Overall : {cv_bench:.2f}")
     print(f"  2D Accuracy      : {acc_2d:.2f}  (ADE={acc_ade:.2f}, COCO={acc_coco:.2f})")
     print(f"  3D Accuracy      : {acc_3d:.2f}  (Omni3D={acc_omni:.2f})")
+    print(f"  Per-Task:")
     for t in sorted(by_task.keys()):
         print(f"    {t:20s}: {acc(by_task[t]):6.2f}  (n={len(by_task[t])})")
     print(f"  Unparsed: {n_unparsed}/{len(results)}")
@@ -246,7 +179,7 @@ def eval_cvbench(model, vl_chat_processor, tokenizer, max_samples=None):
 # MMStar
 # ══════════════════════════════════════════════════════════════════════════════
 
-def eval_mmstar(model, vl_chat_processor, tokenizer, max_samples=None):
+def eval_mmstar(model, tokenizer, max_samples=None):
     print(f"\n{'='*60}\n  MMStar Evaluation\n{'='*60}")
 
     ds = load_dataset("Lin-Chen/MMStar", split="val")
@@ -263,8 +196,7 @@ def eval_mmstar(model, vl_chat_processor, tokenizer, max_samples=None):
             f"{item['question']}\n\nAnswer:"
         )
 
-        response = deepseek_vl_generate(
-            model, vl_chat_processor, tokenizer, item["image"], prompt)
+        response = minicpmv_generate(model, tokenizer, item["image"], prompt)
         extracted = extract_choice_letter(response, max_letter="D")
         answer = item["answer"].strip().upper()
         correct = extracted == answer
@@ -287,6 +219,7 @@ def eval_mmstar(model, vl_chat_processor, tokenizer, max_samples=None):
     n_unparsed = sum(1 for r in results if r["extracted"] is None)
 
     print(f"\n  Overall Accuracy : {overall:.2f}  (n={len(results)})")
+    print(f"  Per Category:")
     cat_accs = {}
     for cat in sorted(by_category.keys()):
         a = acc(by_category[cat])
@@ -344,7 +277,7 @@ def match_realworldqa(response, answer, q_type):
     return False, resp
 
 
-def eval_realworldqa(model, vl_chat_processor, tokenizer, max_samples=None):
+def eval_realworldqa(model, tokenizer, max_samples=None):
     print(f"\n{'='*60}\n  RealWorldQA Evaluation\n{'='*60}")
 
     ds = load_dataset("xai-org/RealworldQA", split="test")
@@ -358,8 +291,7 @@ def eval_realworldqa(model, vl_chat_processor, tokenizer, max_samples=None):
         answer = item["answer"]
         q_type = detect_question_type(question, answer)
 
-        response = deepseek_vl_generate(
-            model, vl_chat_processor, tokenizer, item["image"], question)
+        response = minicpmv_generate(model, tokenizer, item["image"], question)
         correct, extracted = match_realworldqa(response, answer, q_type)
 
         results.append({
@@ -378,6 +310,7 @@ def eval_realworldqa(model, vl_chat_processor, tokenizer, max_samples=None):
     n_unparsed = sum(1 for r in results if r.get("extracted") is None and r["q_type"] == "mcq")
 
     print(f"\n  Overall Accuracy : {overall:.2f}  (n={len(results)})")
+    print(f"  Per Type:")
     per_type = {}
     for t in ["mcq", "yes_no", "short"]:
         if t in by_type:
@@ -432,7 +365,7 @@ def concat_images_horizontal(image_paths, max_height=768):
     return out
 
 
-def eval_blink(model, vl_chat_processor, tokenizer, subtasks=None, max_samples=None):
+def eval_blink(model, tokenizer, subtasks=None, max_samples=None):
     print(f"\n{'='*60}\n  BLINK Evaluation\n{'='*60}")
 
     if subtasks is None:
@@ -483,10 +416,12 @@ def eval_blink(model, vl_chat_processor, tokenizer, subtasks=None, max_samples=N
         )
         if has_image_choices:
             choice_text = "\n".join(
-                [f"{chr(ord('A')+i)}. (Image {i+1})" for i in range(len(choices))])
+                [f"{chr(ord('A')+i)}. (Image {i+1})" for i in range(len(choices))]
+            )
         else:
             choice_text = "\n".join(
-                [f"{chr(ord('A')+i)}. {c}" for i, c in enumerate(choices)])
+                [f"{chr(ord('A')+i)}. {c}" for i, c in enumerate(choices)]
+            )
         prompt_text = (
             "Answer the following question.\n"
             "Select the correct option and output ONLY the letter.\n"
@@ -513,8 +448,7 @@ def eval_blink(model, vl_chat_processor, tokenizer, subtasks=None, max_samples=N
             continue
 
         concat_path = concat_images_horizontal(image_paths)
-        response = deepseek_vl_generate(
-            model, vl_chat_processor, tokenizer, concat_path, prompt_text)
+        response = minicpmv_generate(model, tokenizer, concat_path, prompt_text)
 
         extracted = extract_choice_letter(response)
         answer = item["answer"]
@@ -545,6 +479,7 @@ def eval_blink(model, vl_chat_processor, tokenizer, subtasks=None, max_samples=N
     print(f"\n  BLINK Overall (macro) : {overall:.2f}")
     print(f"  Depth/Spatial         : {acc_ds:.2f}  (n={len(ds_items)})")
     print(f"  Other Tasks           : {acc_other:.2f}  (n={len(other_items)})")
+    print(f"  Per-Subtask:")
     for t in sorted(by_subtask.keys()):
         marker = " *" if t in DEPTH_SPATIAL_SUBTASKS else ""
         print(f"    {t:30s}: {acc(by_subtask[t]):6.2f}  (n={len(by_subtask[t])}){marker}")
@@ -565,15 +500,14 @@ def eval_blink(model, vl_chat_processor, tokenizer, subtasks=None, max_samples=N
 def main():
     global MODEL_ID
 
-    parser = argparse.ArgumentParser(description="DeepSeek-VL Base Evaluation")
+    parser = argparse.ArgumentParser(description="MiniCPM-V 2.6 Base Model Evaluation")
     parser.add_argument("--benchmarks", type=str, nargs="+",
                         default=["cvbench", "mmstar", "realworldqa", "blink"],
                         choices=["cvbench", "mmstar", "realworldqa", "blink"])
     parser.add_argument("--max_samples", type=int, default=None)
-    parser.add_argument("--save_dir", type=str, default="outputs/deepseek_vl_base_results")
+    parser.add_argument("--save_dir", type=str, default="outputs/minicpmv26_results")
     parser.add_argument("--model_id", type=str, default=MODEL_ID,
-                        help="可选: deepseek-ai/deepseek-vl-7b-chat, "
-                             "deepseek-ai/deepseek-vl-1.3b-chat")
+                        help="MiniCPM-V model ID (default: openbmb/MiniCPM-V-2_6)")
     parser.add_argument("--blink_subtasks", type=str, nargs="+", default=None)
     parser.add_argument("--depth_spatial_only", action="store_true")
     args = parser.parse_args()
@@ -581,27 +515,24 @@ def main():
 
     os.makedirs(args.save_dir, exist_ok=True)
 
-    model, vl_chat_processor, tokenizer = load_model()
+    model, tokenizer = load_minicpmv()
 
     all_summary = {}
 
     if "cvbench" in args.benchmarks:
-        metrics, results = eval_cvbench(
-            model, vl_chat_processor, tokenizer, args.max_samples)
+        metrics, results = eval_cvbench(model, tokenizer, args.max_samples)
         all_summary["cvbench"] = metrics
         with open(os.path.join(args.save_dir, "cvbench_results.json"), "w") as f:
             json.dump(results, f, indent=2, ensure_ascii=False)
 
     if "mmstar" in args.benchmarks:
-        metrics, results = eval_mmstar(
-            model, vl_chat_processor, tokenizer, args.max_samples)
+        metrics, results = eval_mmstar(model, tokenizer, args.max_samples)
         all_summary["mmstar"] = metrics
         with open(os.path.join(args.save_dir, "mmstar_results.json"), "w") as f:
             json.dump(results, f, indent=2, ensure_ascii=False)
 
     if "realworldqa" in args.benchmarks:
-        metrics, results = eval_realworldqa(
-            model, vl_chat_processor, tokenizer, args.max_samples)
+        metrics, results = eval_realworldqa(model, tokenizer, args.max_samples)
         all_summary["realworldqa"] = metrics
         with open(os.path.join(args.save_dir, "realworldqa_results.json"), "w") as f:
             json.dump(results, f, indent=2, ensure_ascii=False)
@@ -610,14 +541,13 @@ def main():
         subtasks = args.blink_subtasks
         if args.depth_spatial_only:
             subtasks = DEPTH_SPATIAL_SUBTASKS
-        metrics, results = eval_blink(
-            model, vl_chat_processor, tokenizer, subtasks, args.max_samples)
+        metrics, results = eval_blink(model, tokenizer, subtasks, args.max_samples)
         all_summary["blink"] = metrics
         with open(os.path.join(args.save_dir, "blink_results.json"), "w") as f:
             json.dump(results, f, indent=2, ensure_ascii=False)
 
     print(f"\n{'='*60}")
-    print(f"  DeepSeek-VL Base — Summary")
+    print(f"  MiniCPM-V 2.6 — Summary")
     print(f"{'='*60}")
     for name, m in all_summary.items():
         key = "cv_bench" if name == "cvbench" else "overall"
