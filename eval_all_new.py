@@ -1,7 +1,7 @@
 """
 统一评估脚本：一次性测试 CV-Bench, BLINK, RealWorldQA, MMStar。
 
-支持模式: base, enhanced, spatial, finetune_baseline, no_pcs, both, all
+支持模式: base, enhanced, spatial, finetune_baseline, no_pcs, pcs_only, random_sae, both, all
 
 用法：
     # 全部 benchmark + base vs enhanced
@@ -28,6 +28,15 @@
 
     # 跑5次，采样90%
     python eval/eval_all.py --mode both --num_runs 5 --subsample_ratio 0.9
+
+    # PCS-Only 消融（只保留 PCA suppression，去掉 SAE 注入）
+    python eval_all_new.py --mode random_sae --layer 8 --benchmarks cvbench blink --num_runs 3 --subsample_ratio 0.8
+
+    # Random SAE 消融（SAE 权重随机重置，验证增强效果来自有意义的 SAE 特征）
+    python eval_all.py --mode random_sae --layer 8 --benchmarks cvbench blink --random_sae_seed 42
+
+    # 全部消融一起跑
+    python eval_all.py --mode all --benchmarks cvbench blink mmstar realworldqa
 """
 import os
 import sys
@@ -218,6 +227,49 @@ def load_enhanced_model_no_pcs(args):
         state = torch.load(args.no_pcs_qwen_ckpt, map_location="cpu")
         model.load_state_dict(state, strict=False)
         print("  No-PCS model weights loaded.")
+    model.to(CFG.device)
+    model.eval()
+    return model
+
+
+def load_pcs_only_model(args):
+    """加载 PCS-Only 消融模型：只保留 PCA suppression，去掉 SAE 注入。"""
+    from ablation.Model_pcs_only import QwenWithPCSOnly
+    print("Loading PCS-Only ablation model (SAE injection disabled, PCS active)...")
+    cluster_path = os.path.join(CFG.label_dir, f"feature_clusters_layer{args.layer}.json")
+    model = QwenWithPCSOnly.from_pretrained(
+        model_id=CFG.model_id, sae_ckpt_dir=CFG.save_dir,
+        cluster_path=cluster_path, inject_layer=args.layer,
+        latent_mult=CFG.latent_mult, topk=CFG.topk,
+        top_n_patches=CFG.top_n_patches,
+        predictor_ckpt=args.pcs_only_predictor_ckpt, device=CFG.device,
+    )
+    if args.pcs_only_qwen_ckpt and os.path.exists(args.pcs_only_qwen_ckpt):
+        state = torch.load(args.pcs_only_qwen_ckpt, map_location="cpu")
+        model.load_state_dict(state, strict=False)
+        print("  PCS-Only model weights loaded.")
+    model.to(CFG.device)
+    model.eval()
+    return model
+
+
+def load_random_sae_model(args):
+    """加载 Random SAE 消融模型：SAE 权重随机重置，验证增强效果来自有意义的特征。"""
+    from ablation.Model_random_sae import QwenWithRandomSAE
+    print("Loading Random SAE ablation model (SAE weights randomized)...")
+    cluster_path = os.path.join(CFG.label_dir, f"feature_clusters_layer{args.layer}.json")
+    model = QwenWithRandomSAE.from_pretrained(
+        model_id=CFG.model_id, sae_ckpt_dir=CFG.save_dir,
+        cluster_path=cluster_path, inject_layer=args.layer,
+        latent_mult=CFG.latent_mult, topk=CFG.topk,
+        top_n_patches=CFG.top_n_patches,
+        predictor_ckpt=args.random_sae_predictor_ckpt, device=CFG.device,
+        random_seed=args.random_sae_seed,
+    )
+    if args.random_sae_qwen_ckpt and os.path.exists(args.random_sae_qwen_ckpt):
+        state = torch.load(args.random_sae_qwen_ckpt, map_location="cpu")
+        model.load_state_dict(state, strict=False)
+        print("  Random SAE model weights loaded.")
     model.to(CFG.device)
     model.eval()
     return model
@@ -906,6 +958,7 @@ def main():
     parser = argparse.ArgumentParser(description="Unified Evaluation: 4 Benchmarks")
     parser.add_argument("--mode", type=str, default="both",
                         choices=["base", "enhanced", "spatial", "no_pcs",
+                                 "pcs_only", "random_sae",
                                  "finetune_baseline", "both", "all"])
     parser.add_argument("--benchmarks", type=str, nargs="+",
                         default=["cvbench", "mmstar", "realworldqa", "blink"],
@@ -924,6 +977,20 @@ def main():
     parser.add_argument("--no_pcs_predictor_ckpt", type=str,
                         default="outputs/evaluation/ablation_no_pcs/predictor_best.pt")
     parser.add_argument("--no_pcs_qwen_ckpt", type=str, default=None)
+    # PCS-Only 消融参数
+    parser.add_argument("--pcs_only_predictor_ckpt", type=str,
+                        default=None,
+                        help="PCS-Only predictor ckpt (默认复用 --predictor_ckpt)")
+    parser.add_argument("--pcs_only_qwen_ckpt", type=str, default=None,
+                        help="PCS-Only Qwen weights (默认复用 --qwen_ckpt)")
+    # Random SAE 消融参数
+    parser.add_argument("--random_sae_predictor_ckpt", type=str,
+                        default=None,
+                        help="Random SAE predictor ckpt (默认复用 --predictor_ckpt)")
+    parser.add_argument("--random_sae_qwen_ckpt", type=str, default=None,
+                        help="Random SAE Qwen weights (默认复用 --qwen_ckpt)")
+    parser.add_argument("--random_sae_seed", type=int, default=42,
+                        help="Random seed for SAE weight randomization")
     # BLINK 特有
     parser.add_argument("--blink_subtasks", type=str, nargs="+", default=None)
     parser.add_argument("--depth_spatial_only", action="store_true")
@@ -937,14 +1004,26 @@ def main():
     parser.add_argument("--max_samples", type=int, default=None)
     args = parser.parse_args()
 
+    # ── 默认值回退：消融模型复用主模型的 ckpt ──
+    if args.pcs_only_predictor_ckpt is None:
+        args.pcs_only_predictor_ckpt = args.predictor_ckpt
+    if args.pcs_only_qwen_ckpt is None:
+        args.pcs_only_qwen_ckpt = args.qwen_ckpt
+    if args.random_sae_predictor_ckpt is None:
+        args.random_sae_predictor_ckpt = args.predictor_ckpt
+    if args.random_sae_qwen_ckpt is None:
+        args.random_sae_qwen_ckpt = args.qwen_ckpt
+
     os.makedirs(args.save_dir, exist_ok=True)
 
     # ── 确定哪些模型要跑 ──
-    run_base     = args.mode in ["base", "both", "all"]
-    run_ft_base  = args.mode in ["finetune_baseline", "all"]
-    run_no_pcs   = args.mode in ["no_pcs", "all"]
-    run_enhanced = args.mode in ["enhanced", "both", "all"]
-    run_spatial  = args.mode in ["spatial", "all"]
+    run_base       = args.mode in ["base", "both", "all"]
+    run_ft_base    = args.mode in ["finetune_baseline", "all"]
+    run_no_pcs     = args.mode in ["no_pcs", "all"]
+    run_pcs_only   = args.mode in ["pcs_only", "all"]
+    run_random_sae = args.mode in ["random_sae", "all"]
+    run_enhanced   = args.mode in ["enhanced", "both", "all"]
+    run_spatial    = args.mode in ["spatial", "all"]
 
     # ── 加载完整数据集（只加载一次，所有模型和所有 run 共用） ──
     datasets_full = {}
@@ -970,6 +1049,8 @@ def main():
     base_model, processor = None, None
     ft_model, ft_proc = None, None
     no_pcs_model = None
+    pcs_only_model = None
+    random_sae_model = None
     enhanced_model = None
     spatial_model = None
 
@@ -980,6 +1061,10 @@ def main():
         ft_model, ft_proc = load_finetune_baseline(ft_ckpt)
     if run_no_pcs:
         no_pcs_model = load_enhanced_model_no_pcs(args)
+    if run_pcs_only:
+        pcs_only_model = load_pcs_only_model(args)
+    if run_random_sae:
+        random_sae_model = load_random_sae_model(args)
     if run_enhanced:
         enhanced_model = load_enhanced_model(args)
     if run_spatial:
@@ -1042,7 +1127,25 @@ def main():
             for bench, m in metrics.items():
                 run_results[bench][label] = m
 
-        # ── 4. Enhanced (v1) ──
+        # ── 4. PCS-Only Ablation ──
+        if run_pcs_only:
+            label = "pcs_only"
+            model_labels_this_run.append(label)
+            metrics = run_all_benchmarks_enhanced(
+                pcs_only_model, datasets, label, run_save_dir)
+            for bench, m in metrics.items():
+                run_results[bench][label] = m
+
+        # ── 5. Random SAE Ablation ──
+        if run_random_sae:
+            label = "random_sae"
+            model_labels_this_run.append(label)
+            metrics = run_all_benchmarks_enhanced(
+                random_sae_model, datasets, label, run_save_dir)
+            for bench, m in metrics.items():
+                run_results[bench][label] = m
+
+        # ── 6. Enhanced (v1) ──
         if run_enhanced:
             label = "enhanced"
             model_labels_this_run.append(label)
@@ -1051,7 +1154,7 @@ def main():
             for bench, m in metrics.items():
                 run_results[bench][label] = m
 
-        # ── 5. Spatial (v2) ──
+        # ── 7. Spatial (v2) ──
         if run_spatial:
             label = "spatial"
             model_labels_this_run.append(label)
@@ -1069,7 +1172,8 @@ def main():
 
     # ── 释放模型显存 ──
     del base_model, processor, ft_model, ft_proc
-    del no_pcs_model, enhanced_model, spatial_model
+    del no_pcs_model, pcs_only_model, random_sae_model
+    del enhanced_model, spatial_model
     torch.cuda.empty_cache()
 
     # ── 多次运行汇总 ──

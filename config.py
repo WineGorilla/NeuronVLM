@@ -36,7 +36,7 @@ class Config:
 
     # ── 路径 ──────────────────────────────────────────────────
     save_llava_dir: str = "outputs/llava/sae_ckpt"
-    save_dir: str = "outputs/qwen_layer8_old/sae_ckpt"
+    save_dir: str = "outputs/qwen/sae_ckpt"
 
     llava_cache_dir: str = "outputs/llava_next"
     cache_dir: str = "outputs/qwen"
