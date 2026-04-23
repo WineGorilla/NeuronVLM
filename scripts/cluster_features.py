@@ -24,7 +24,7 @@
     }
 
 用法：
-    python scripts/cluster_features.py --layer 6 --n_clusters 64
+    CUDA_VISIBLE_DEVICES=1 python scripts/cluster_features.py --layer 8 --n_clusters 32
 """
 import os
 import sys

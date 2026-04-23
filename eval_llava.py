@@ -1,42 +1,26 @@
 """
-统一评估脚本：一次性测试 CV-Bench, BLINK, RealWorldQA, MMStar。
+统一评估脚本（LLaVA-NeXT-LLaMA3-8B 版）：一次性测试 CV-Bench, BLINK, RealWorldQA, MMStar。
 
-支持模式: base, enhanced, spatial, finetune_baseline, no_pcs, pcs_only, random_sae, both, all
+只支持 base 和 enhanced 两种模式，默认跑 3 次报告 mean±std。
 
 用法：
-    # 全部 benchmark + base vs enhanced
-    python scripts/eval_all.py --mode enhanced --layer 8 --no_pcs --benchmarks cvbench blink --num_runs 3 --subsample_ratio 0.8
-    python eval_all_new.py --mode enhanced --layer 8 --benchmarks cvbench blink --num_runs 3 --subsample_ratio 0.8
-    python eval_all.py --mode finetune_baseline --layer 8 --benchmarks cvbench blink --num_runs 3 --subsample_ratio 0.8
-    # 只跑指定 benchmark
-    python eval_all_new.py --mode enhanced --benchmarks cvbench blink
+    # 默认：base + enhanced，跑3次，采样80%
+    python eval_llava.py --benchmarks cvbench blink mmstar realworldqa
 
-    # 全部模型对比
-    python eval/eval_all.py --mode all --qwen_ckpt outputs/ablation_baseline/qwen_best.pt
+    # 只跑 base
+    python eval_all.py --mode base --benchmarks cvbench blink mmstar realworldqa
 
-    # 限制样本数（快速测试）
-    python eval/eval_all.py --mode both --max_samples 50
-
-    # BLINK 只跑 depth/spatial 子任务
-    python eval/eval_all.py --mode both --depth_spatial_only
-
-    # 指定 spatial 权重
-    python eval/eval_all.py --mode spatial --spatial_qwen_ckpt outputs/focus_v2_ckpt/qwen_best.pt
-
-    # 跑3次，报告 mean±std（每次随机采样80%数据）
-    python eval_all.py --mode both --num_runs 3 --subsample_ratio 0.8
+    # 只跑 enhanced
+    python eval_llava.py --mode enhanced --layer 8 --benchmarks cvbench blink
 
     # 跑5次，采样90%
-    python eval/eval_all.py --mode both --num_runs 5 --subsample_ratio 0.9
+    python eval_all.py --mode both --num_runs 5 --subsample_ratio 0.9
 
-    # PCS-Only 消融（只保留 PCA suppression，去掉 SAE 注入）
-    python eval_all_new.py --mode random_sae --layer 8 --benchmarks cvbench blink --num_runs 3 --subsample_ratio 0.8
+    # BLINK 只跑 depth/spatial 子任务
+    python eval_all.py --mode both --depth_spatial_only
 
-    # Random SAE 消融（SAE 权重随机重置，验证增强效果来自有意义的 SAE 特征）
-    python eval_all.py --mode random_sae --layer 8 --benchmarks cvbench blink --random_sae_seed 42
-
-    # 全部消融一起跑
-    python eval_all.py --mode all --benchmarks cvbench blink mmstar realworldqa
+    # 限制样本数（快速测试）
+    python eval_all.py --mode both --max_samples 50
 """
 import os
 import sys
@@ -54,7 +38,8 @@ from datasets import load_dataset
 from PIL import Image
 from tqdm import tqdm
 
-from config import CFG
+
+MODEL_ID = "llava-hf/llava-v1.6-mistral-7b-hf"#"llava-hf/llama3-llava-next-8b-hf"
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -143,176 +128,90 @@ def subsample(ds, ratio, seed, is_list=False):
 # 模型加载
 # ══════════════════════════════════════════════════════════════════════════════
 
-def load_base_model():
-    from transformers import Qwen2_5_VLForConditionalGeneration, AutoProcessor
-    print("Loading vanilla Qwen2.5-VL for baseline...")
-    processor = AutoProcessor.from_pretrained(CFG.model_id)
-    model = Qwen2_5_VLForConditionalGeneration.from_pretrained(
-        CFG.model_id, torch_dtype=torch.float16, device_map=CFG.device,
-    )
-    model.eval()
-    return model, processor
+def load_base_model(model_id=MODEL_ID):
+    """加载原始 LLaVA-NeXT-LLaMA3-8B 模型。"""
+    from transformers import LlavaNextProcessor, LlavaNextForConditionalGeneration
 
-
-def load_finetune_baseline(qwen_ckpt):
-    from transformers import Qwen2_5_VLForConditionalGeneration, AutoProcessor
-    print("Loading finetune baseline (Qwen + finetuned layers, no hooks)...")
-    processor = AutoProcessor.from_pretrained(CFG.model_id)
-    model = Qwen2_5_VLForConditionalGeneration.from_pretrained(
-        CFG.model_id, torch_dtype=torch.float16, device_map=CFG.device,
-    )
-    if qwen_ckpt and os.path.exists(qwen_ckpt):
-        print(f"  Loading finetuned weights: {qwen_ckpt}")
-        state = torch.load(qwen_ckpt, map_location="cpu")
-        model.load_state_dict(state, strict=False)
-        print(f"  Loaded {len(state)} weight tensors.")
-    else:
-        print("  WARNING: --qwen_ckpt not provided or not found, using vanilla model!")
-    model.eval()
+    print(f"Loading LLaVA-NeXT base: {model_id}")
+    processor = LlavaNextProcessor.from_pretrained(model_id)
+    model = LlavaNextForConditionalGeneration.from_pretrained(
+        model_id, torch_dtype=torch.float16, device_map="auto",
+    ).eval()
+    print("  Base model loaded.")
     return model, processor
 
 
 def load_enhanced_model(args):
-    from src.Model import QwenWithClusterPredictorAndSAE
-    print("Loading enhanced model (ClusterPredictor + SAE)...")
-    cluster_path = os.path.join(CFG.label_dir, f"feature_clusters_layer{args.layer}.json")
-    model = QwenWithClusterPredictorAndSAE.from_pretrained(
-        model_id=CFG.model_id, sae_ckpt_dir=CFG.save_dir,
-        cluster_path=cluster_path, inject_layer=args.layer,
-        latent_mult=CFG.latent_mult, topk=CFG.topk,
-        top_n_patches=CFG.top_n_patches,
-        predictor_ckpt=args.predictor_ckpt, device=CFG.device,
+    """加载增强模型 (LlavaNextWithClusterPredictorAndSAE)。"""
+    from llava_next.Model_llava_next import LlavaNextWithClusterPredictorAndSAE
+
+    print("Loading enhanced model (LlavaNext + ClusterPredictor + SAE)...")
+    cluster_path = os.path.join(args.label_dir,
+                                f"feature_clusters_layer{args.layer}.json")
+    model = LlavaNextWithClusterPredictorAndSAE.from_pretrained(
+        model_id=args.model_id,
+        sae_ckpt_dir=args.sae_ckpt_dir,
+        cluster_path=cluster_path,
+        inject_layer=args.layer,
+        latent_mult=args.latent_mult,
+        topk=args.topk,
+        top_n_patches=args.top_n_patches,
+        predictor_ckpt=args.predictor_ckpt,
+        device=args.device,
     )
     if args.qwen_ckpt and os.path.exists(args.qwen_ckpt):
         state = torch.load(args.qwen_ckpt, map_location="cpu")
         model.load_state_dict(state, strict=False)
         print("  Enhanced model weights (Stage 2) loaded.")
-    model.to(CFG.device)
-    model.eval()
-    return model
-
-
-def load_spatial_model(args):
-    from src.Model_v2 import QwenWithClusterPredictorAndSAE
-    print("Loading spatial model (Model_v2: enhanced + SpatialPatchInteraction)...")
-    cluster_path = os.path.join(CFG.label_dir, f"feature_clusters_layer{args.layer}.json")
-    model = QwenWithClusterPredictorAndSAE.from_pretrained(
-        model_id=CFG.model_id, sae_ckpt_dir=CFG.save_dir,
-        cluster_path=cluster_path, inject_layer=args.layer,
-        latent_mult=CFG.latent_mult, topk=CFG.topk,
-        top_n_patches=CFG.top_n_patches,
-        predictor_ckpt=args.spatial_predictor_ckpt, device=CFG.device,
-    )
-    if args.spatial_qwen_ckpt and os.path.exists(args.spatial_qwen_ckpt):
-        state = torch.load(args.spatial_qwen_ckpt, map_location="cpu")
-        model.load_state_dict(state, strict=False)
-        print("  Spatial model weights (Stage 2) loaded.")
-    model.to(CFG.device)
-    model.eval()
-    return model
-
-
-def load_enhanced_model_no_pcs(args):
-    from ablation.Model_no_pcs import QwenWithClusterPredictorAndSAE
-    print("Loading enhanced model (NO PCS ablation)...")
-    cluster_path = os.path.join(CFG.label_dir, f"feature_clusters_layer{args.layer}.json")
-    model = QwenWithClusterPredictorAndSAE.from_pretrained(
-        model_id=CFG.model_id, sae_ckpt_dir=CFG.save_dir,
-        cluster_path=cluster_path, inject_layer=args.layer,
-        latent_mult=CFG.latent_mult, topk=CFG.topk,
-        top_n_patches=CFG.top_n_patches,
-        predictor_ckpt=args.no_pcs_predictor_ckpt, device=CFG.device,
-    )
-    if args.no_pcs_qwen_ckpt and os.path.exists(args.no_pcs_qwen_ckpt):
-        state = torch.load(args.no_pcs_qwen_ckpt, map_location="cpu")
-        model.load_state_dict(state, strict=False)
-        print("  No-PCS model weights loaded.")
-    model.to(CFG.device)
-    model.eval()
-    return model
-
-
-def load_pcs_only_model(args):
-    """加载 PCS-Only 消融模型：只保留 PCA suppression，去掉 SAE 注入。"""
-    from ablation.Model_pcs_only import QwenWithPCSOnly
-    print("Loading PCS-Only ablation model (SAE injection disabled, PCS active)...")
-    cluster_path = os.path.join(CFG.label_dir, f"feature_clusters_layer{args.layer}.json")
-    model = QwenWithPCSOnly.from_pretrained(
-        model_id=CFG.model_id, sae_ckpt_dir=CFG.save_dir,
-        cluster_path=cluster_path, inject_layer=args.layer,
-        latent_mult=CFG.latent_mult, topk=CFG.topk,
-        top_n_patches=CFG.top_n_patches,
-        predictor_ckpt=args.pcs_only_predictor_ckpt, device=CFG.device,
-    )
-    if args.pcs_only_qwen_ckpt and os.path.exists(args.pcs_only_qwen_ckpt):
-        state = torch.load(args.pcs_only_qwen_ckpt, map_location="cpu")
-        model.load_state_dict(state, strict=False)
-        print("  PCS-Only model weights loaded.")
-    model.to(CFG.device)
-    model.eval()
-    return model
-
-
-def load_random_sae_model(args):
-    """加载 Random SAE 消融模型：SAE 权重随机重置，验证增强效果来自有意义的特征。"""
-    from ablation.Model_random_sae import QwenWithRandomSAE
-    print("Loading Random SAE ablation model (SAE weights randomized)...")
-    cluster_path = os.path.join(CFG.label_dir, f"feature_clusters_layer{args.layer}.json")
-    model = QwenWithRandomSAE.from_pretrained(
-        model_id=CFG.model_id, sae_ckpt_dir=CFG.save_dir,
-        cluster_path=cluster_path, inject_layer=args.layer,
-        latent_mult=CFG.latent_mult, topk=CFG.topk,
-        top_n_patches=CFG.top_n_patches,
-        predictor_ckpt=args.random_sae_predictor_ckpt, device=CFG.device,
-        random_seed=args.random_sae_seed,
-    )
-    if args.random_sae_qwen_ckpt and os.path.exists(args.random_sae_qwen_ckpt):
-        state = torch.load(args.random_sae_qwen_ckpt, map_location="cpu")
-        model.load_state_dict(state, strict=False)
-        print("  Random SAE model weights loaded.")
-    model.to(CFG.device)
     model.eval()
     return model
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-# 推理封装：base 模型 (Qwen2.5-VL 原始推理)
+# 推理封装
 # ══════════════════════════════════════════════════════════════════════════════
 
-def base_generate(model, processor, image_path: str, prompt: str,
-                  max_new_tokens: int = 32) -> str:
-    """用原始 Qwen2.5-VL 推理。"""
-    from qwen_vl_utils import process_vision_info
+def base_generate(model, processor, image, prompt, max_new_tokens=32):
+    """用原始 LLaVA-NeXT 推理。"""
     try:
-        messages = [{
-            "role": "user",
-            "content": [
-                {"type": "image", "image": f"file://{image_path}"},
-                {"type": "text", "text": prompt},
-            ],
-        }]
+        if isinstance(image, str):
+            image = Image.open(image).convert("RGB")
+        elif isinstance(image, Image.Image):
+            image = image.convert("RGB")
+        else:
+            return ""
+
+        conversation = [
+            {
+                "role": "user",
+                "content": [
+                    {"type": "image"},
+                    {"type": "text", "text": prompt},
+                ],
+            }
+        ]
         text = processor.apply_chat_template(
-            messages, tokenize=False, add_generation_prompt=True
+            conversation, add_generation_prompt=True,
         )
-        image_inputs, video_inputs = process_vision_info(messages)
         inputs = processor(
-            text=[text], images=image_inputs, videos=video_inputs,
-            padding=True, return_tensors="pt",
+            images=image, text=text, return_tensors="pt",
         ).to(model.device)
+
         with torch.no_grad():
             output_ids = model.generate(
                 **inputs, max_new_tokens=max_new_tokens, do_sample=False,
             )
         input_len = inputs["input_ids"].shape[1]
         return processor.decode(
-            output_ids[0, input_len:], skip_special_tokens=True
+            output_ids[0, input_len:], skip_special_tokens=True,
         ).strip()
+
     except Exception as e:
         print(f"  [error] base_generate: {e}")
         return ""
 
 
-def enhanced_generate(model, image_path: str, prompt: str) -> dict:
+def enhanced_generate(model, image_path, prompt):
     """用增强模型推理，返回 dict(final_answer, cluster_ids)。"""
     try:
         return model.generate(image_path=image_path, question=prompt, verbose=False)
@@ -325,12 +224,9 @@ def enhanced_generate(model, image_path: str, prompt: str) -> dict:
 # CV-Bench
 # ══════════════════════════════════════════════════════════════════════════════
 
-def load_cvbench(max_samples=None, subset=None):
+def load_cvbench(max_samples=None):
     print("Loading CV-Bench...")
-    if subset:
-        ds = load_dataset("nyu-visionx/CV-Bench", subset, split="test")
-    else:
-        ds = load_dataset("nyu-visionx/CV-Bench", split="test")
+    ds = load_dataset("nyu-visionx/CV-Bench", split="test")
     if max_samples:
         ds = ds.select(range(min(max_samples, len(ds))))
     print(f"  Samples: {len(ds)}")
@@ -352,20 +248,19 @@ def eval_cvbench_single(model, processor, ds, is_enhanced=False, label=""):
             f"{item['prompt']}\n\nChoices:\n{choice_text}\n\nAnswer:"
         )
 
-        tmp_path = "/tmp/eval_all_cvbench.png"
         img = item["image"]
-        if isinstance(img, Image.Image):
-            img.save(tmp_path)
-        else:
-            tmp_path = img
-
-        cluster_ids = []
         if is_enhanced:
+            tmp_path = "/tmp/eval_all_cvbench.png"
+            if isinstance(img, Image.Image):
+                img.save(tmp_path)
+            else:
+                tmp_path = img
             res = enhanced_generate(model, tmp_path, prompt)
             response = res["final_answer"]
             cluster_ids = res.get("cluster_ids", [])
         else:
-            response = base_generate(model, processor, tmp_path, prompt)
+            response = base_generate(model, processor, img, prompt)
+            cluster_ids = []
 
         extracted = extract_choice_letter(response)
         if extracted is None:
@@ -441,20 +336,19 @@ def eval_mmstar_single(model, processor, ds, is_enhanced=False, label=""):
             f"{item['question']}\n\nAnswer:"
         )
 
-        tmp_path = "/tmp/eval_all_mmstar.png"
         img = item["image"]
-        if isinstance(img, Image.Image):
-            img.save(tmp_path)
-        else:
-            tmp_path = img
-
-        cluster_ids = []
         if is_enhanced:
+            tmp_path = "/tmp/eval_all_mmstar.png"
+            if isinstance(img, Image.Image):
+                img.save(tmp_path)
+            else:
+                tmp_path = img
             res = enhanced_generate(model, tmp_path, prompt)
             response = res["final_answer"]
             cluster_ids = res.get("cluster_ids", [])
         else:
-            response = base_generate(model, processor, tmp_path, prompt)
+            response = base_generate(model, processor, img, prompt)
+            cluster_ids = []
 
         extracted = extract_choice_letter(response, max_letter="D")
         answer = item["answer"].strip().upper()
@@ -525,7 +419,6 @@ def match_realworldqa(response: str, answer: str, q_type: str):
             return "No" == ans, "No"
         return False, None
 
-    # short answer
     resp_norm = resp.split("\n")[0].strip().lower().rstrip(".")
     ans_norm = ans.lower().rstrip(".")
     if resp_norm == ans_norm or resp_norm.startswith(ans_norm):
@@ -555,20 +448,19 @@ def eval_realworldqa_single(model, processor, ds, is_enhanced=False, label=""):
         answer = item["answer"]
         q_type = detect_question_type(question, answer)
 
-        tmp_path = "/tmp/eval_all_rwqa.png"
         img = item["image"]
-        if isinstance(img, Image.Image):
-            img.save(tmp_path)
-        else:
-            tmp_path = img
-
-        cluster_ids = []
         if is_enhanced:
+            tmp_path = "/tmp/eval_all_rwqa.png"
+            if isinstance(img, Image.Image):
+                img.save(tmp_path)
+            else:
+                tmp_path = img
             res = enhanced_generate(model, tmp_path, question)
             response = res["final_answer"]
             cluster_ids = res.get("cluster_ids", [])
         else:
-            response = base_generate(model, processor, tmp_path, question)
+            response = base_generate(model, processor, img, question)
+            cluster_ids = []
 
         correct, extracted = match_realworldqa(response, answer, q_type)
 
@@ -676,7 +568,6 @@ def eval_blink_single(model, processor, dataset, is_enhanced=False, label=""):
             f"{item['prompt']}\n\nChoices:\n{choice_text}\n\nAnswer:"
         )
 
-        # 保存图片
         image_paths = []
         for key in ["image_1", "image_2", "image_3", "image_4"]:
             img = item.get(key)
@@ -695,13 +586,13 @@ def eval_blink_single(model, processor, dataset, is_enhanced=False, label=""):
 
         concat_path = concat_images_horizontal(image_paths)
 
-        cluster_ids = []
         if is_enhanced:
             res = enhanced_generate(model, concat_path, prompt)
             response = res["final_answer"]
             cluster_ids = res.get("cluster_ids", [])
         else:
             response = base_generate(model, processor, concat_path, prompt)
+            cluster_ids = []
 
         extracted = extract_choice_letter(response)
         if extracted is None:
@@ -757,9 +648,6 @@ def compute_blink_metrics(results, label=""):
 # ══════════════════════════════════════════════════════════════════════════════
 
 def print_grand_summary(all_results: dict, model_labels: list):
-    """
-    all_results: {benchmark: {model_label: metrics_dict}}
-    """
     print(f"\n{'═'*75}")
     print(f"  Grand Summary — All Benchmarks × All Models")
     print(f"{'═'*75}")
@@ -773,14 +661,14 @@ def print_grand_summary(all_results: dict, model_labels: list):
     print(f"  {'─'*70}")
 
     bench_keys = [
-        ("CV-Bench", "cvbench", "cv_bench"),
-        ("  2D", "cvbench", "acc_2d"),
-        ("  3D", "cvbench", "acc_3d"),
-        ("MMStar", "mmstar", "overall"),
-        ("RealWorldQA", "realworldqa", "overall"),
-        ("BLINK Overall", "blink", "overall"),
-        ("  Depth/Spatial", "blink", "acc_depth_spatial"),
-        ("  Other", "blink", "acc_other"),
+        ("CV-Bench",        "cvbench",     "cv_bench"),
+        ("  2D",            "cvbench",     "acc_2d"),
+        ("  3D",            "cvbench",     "acc_3d"),
+        ("MMStar",          "mmstar",      "overall"),
+        ("RealWorldQA",     "realworldqa", "overall"),
+        ("BLINK Overall",   "blink",       "overall"),
+        ("  Depth/Spatial", "blink",       "acc_depth_spatial"),
+        ("  Other",         "blink",       "acc_other"),
     ]
 
     for name, bench, key in bench_keys:
@@ -801,10 +689,6 @@ def print_grand_summary(all_results: dict, model_labels: list):
 
 
 def aggregate_multi_runs(all_runs_results: list, model_labels: list):
-    """
-    all_runs_results: list of {benchmark: {model_label: metrics_dict}}
-    返回: {benchmark: {model_label: {metric: {"mean": x, "std": x, "runs": [...]}}}}
-    """
     benchmarks = set()
     for run in all_runs_results:
         benchmarks.update(run.keys())
@@ -813,12 +697,10 @@ def aggregate_multi_runs(all_runs_results: list, model_labels: list):
     for bench in benchmarks:
         aggregated[bench] = {}
         for ml in model_labels:
-            # 收集每次 run 的 metrics
             all_metrics = [run[bench][ml] for run in all_runs_results
                            if bench in run and ml in run[bench]]
             if not all_metrics:
                 continue
-            # 提取所有数值型 key
             agg = {}
             for key in all_metrics[0]:
                 vals = [m[key] for m in all_metrics if key in m]
@@ -882,7 +764,6 @@ def print_grand_summary_with_std(aggregated: dict, model_labels: list):
 # ══════════════════════════════════════════════════════════════════════════════
 
 def run_all_benchmarks_base(model, processor, datasets, model_label, save_dir):
-    """用 base 类模型跑所有已加载的 benchmark。"""
     metrics = {}
 
     if "cvbench" in datasets:
@@ -913,7 +794,6 @@ def run_all_benchmarks_base(model, processor, datasets, model_label, save_dir):
 
 
 def run_all_benchmarks_enhanced(model, datasets, model_label, save_dir):
-    """用增强类模型跑所有已加载的 benchmark。"""
     metrics = {}
 
     if "cvbench" in datasets:
@@ -955,77 +835,49 @@ def _save_results(results, save_dir, filename):
 # ══════════════════════════════════════════════════════════════════════════════
 
 def main():
-    parser = argparse.ArgumentParser(description="Unified Evaluation: 4 Benchmarks")
+    parser = argparse.ArgumentParser(
+        description="LLaVA-NeXT-LLaMA3-8B Evaluation: base vs enhanced, 3 runs")
     parser.add_argument("--mode", type=str, default="both",
-                        choices=["base", "enhanced", "spatial", "no_pcs",
-                                 "pcs_only", "random_sae",
-                                 "finetune_baseline", "both", "all"])
+                        choices=["base", "enhanced", "both"])
     parser.add_argument("--benchmarks", type=str, nargs="+",
                         default=["cvbench", "mmstar", "realworldqa", "blink"],
                         choices=["cvbench", "mmstar", "realworldqa", "blink"])
-    parser.add_argument("--layer", type=int, default=CFG.vis_layer)
+    # 模型参数
+    parser.add_argument("--model_id", type=str, default=MODEL_ID)
+    parser.add_argument("--device", type=str, default="cuda")
+    # Enhanced 模型参数
+    parser.add_argument("--layer", type=int, default=8)
+    parser.add_argument("--sae_ckpt_dir", type=str,
+                        default="outputs/sae_llava_next")
+    parser.add_argument("--label_dir", type=str,
+                        default="assets/llava_next_labels")
     parser.add_argument("--predictor_ckpt", type=str,
-                        default="outputs/qwen_layer8_old/focus_ckpt_0.75_128_5000/predictor_best.pt")
+                        default="outputs/llava_next_ckpt/predictor_best.pt")
     parser.add_argument("--qwen_ckpt", type=str, default=None,
-                        help="For enhanced: Stage 2 weights. "
-                             "For finetune_baseline: ablation weights.")
-    parser.add_argument("--baseline_ckpt", type=str, default=None,
-                        help="Finetune baseline weights (used in --mode all)")
-    parser.add_argument("--spatial_predictor_ckpt", type=str,
-                        default="outputs/focus_ckpt_spatial/predictor_best.pt")
-    parser.add_argument("--spatial_qwen_ckpt", type=str, default=None)
-    parser.add_argument("--no_pcs_predictor_ckpt", type=str,
-                        default="outputs/evaluation/ablation_no_pcs/predictor_best.pt")
-    parser.add_argument("--no_pcs_qwen_ckpt", type=str, default=None)
-    # PCS-Only 消融参数
-    parser.add_argument("--pcs_only_predictor_ckpt", type=str,
-                        default=None,
-                        help="PCS-Only predictor ckpt (默认复用 --predictor_ckpt)")
-    parser.add_argument("--pcs_only_qwen_ckpt", type=str, default=None,
-                        help="PCS-Only Qwen weights (默认复用 --qwen_ckpt)")
-    # Random SAE 消融参数
-    parser.add_argument("--random_sae_predictor_ckpt", type=str,
-                        default=None,
-                        help="Random SAE predictor ckpt (默认复用 --predictor_ckpt)")
-    parser.add_argument("--random_sae_qwen_ckpt", type=str, default=None,
-                        help="Random SAE Qwen weights (默认复用 --qwen_ckpt)")
-    parser.add_argument("--random_sae_seed", type=int, default=42,
-                        help="Random seed for SAE weight randomization")
+                        help="Enhanced model Stage 2 weights.")
+    parser.add_argument("--latent_mult", type=int, default=32)
+    parser.add_argument("--topk", type=int, default=32)
+    parser.add_argument("--top_n_patches", type=int, default=60)
     # BLINK 特有
     parser.add_argument("--blink_subtasks", type=str, nargs="+", default=None)
     parser.add_argument("--depth_spatial_only", action="store_true")
-    # 多次运行
-    parser.add_argument("--num_runs", type=int, default=1,
+    # 多次运行（默认3次）
+    parser.add_argument("--num_runs", type=int, default=3,
                         help="重复跑几次，报告 mean±std（每次随机采样子集）")
     parser.add_argument("--subsample_ratio", type=float, default=0.8,
                         help="每次 run 采样数据的比例（默认 0.8 即 80%%）")
     # 通用
-    parser.add_argument("--save_dir", type=str, default="outputs/eval_all_results")
+    parser.add_argument("--save_dir", type=str,
+                        default="outputs/llava_next_eval_results")
     parser.add_argument("--max_samples", type=int, default=None)
     args = parser.parse_args()
 
-    # ── 默认值回退：消融模型复用主模型的 ckpt ──
-    if args.pcs_only_predictor_ckpt is None:
-        args.pcs_only_predictor_ckpt = args.predictor_ckpt
-    if args.pcs_only_qwen_ckpt is None:
-        args.pcs_only_qwen_ckpt = args.qwen_ckpt
-    if args.random_sae_predictor_ckpt is None:
-        args.random_sae_predictor_ckpt = args.predictor_ckpt
-    if args.random_sae_qwen_ckpt is None:
-        args.random_sae_qwen_ckpt = args.qwen_ckpt
-
     os.makedirs(args.save_dir, exist_ok=True)
 
-    # ── 确定哪些模型要跑 ──
-    run_base       = args.mode in ["base", "both", "all"]
-    run_ft_base    = args.mode in ["finetune_baseline", "all"]
-    run_no_pcs     = args.mode in ["no_pcs", "all"]
-    run_pcs_only   = args.mode in ["pcs_only", "all"]
-    run_random_sae = args.mode in ["random_sae", "all"]
-    run_enhanced   = args.mode in ["enhanced", "both", "all"]
-    run_spatial    = args.mode in ["spatial", "all"]
+    run_base     = args.mode in ["base", "both"]
+    run_enhanced = args.mode in ["enhanced", "both"]
 
-    # ── 加载完整数据集（只加载一次，所有模型和所有 run 共用） ──
+    # ── 加载完整数据集（只加载一次） ──
     datasets_full = {}
 
     if "cvbench" in args.benchmarks:
@@ -1045,57 +897,36 @@ def main():
             blink_subtasks = ALL_BLINK_SUBTASKS
         datasets_full["blink"] = load_blink(blink_subtasks, args.max_samples)
 
-    # ── 预加载所有需要的模型（避免每次 run 重复加载） ──
+    # ── 预加载模型 ──
     base_model, processor = None, None
-    ft_model, ft_proc = None, None
-    no_pcs_model = None
-    pcs_only_model = None
-    random_sae_model = None
     enhanced_model = None
-    spatial_model = None
 
     if run_base:
-        base_model, processor = load_base_model()
-    if run_ft_base:
-        ft_ckpt = args.baseline_ckpt or args.qwen_ckpt
-        ft_model, ft_proc = load_finetune_baseline(ft_ckpt)
-    if run_no_pcs:
-        no_pcs_model = load_enhanced_model_no_pcs(args)
-    if run_pcs_only:
-        pcs_only_model = load_pcs_only_model(args)
-    if run_random_sae:
-        random_sae_model = load_random_sae_model(args)
+        base_model, processor = load_base_model(args.model_id)
     if run_enhanced:
         enhanced_model = load_enhanced_model(args)
-    if run_spatial:
-        spatial_model = load_spatial_model(args)
 
     # ── 多次运行循环 ──
     all_runs_results = []
     model_labels = []
 
     for run_idx in range(args.num_runs):
-        if args.num_runs > 1:
-            print(f"\n{'▶'*30} Run {run_idx+1}/{args.num_runs} "
-                  f"(seed={42+run_idx}, ratio={args.subsample_ratio}) {'◀'*30}\n")
+        print(f"\n{'▶'*30} Run {run_idx+1}/{args.num_runs} "
+              f"(seed={42+run_idx}, ratio={args.subsample_ratio}) {'◀'*30}\n")
 
-        run_save_dir = (os.path.join(args.save_dir, f"run_{run_idx}")
-                        if args.num_runs > 1 else args.save_dir)
+        run_save_dir = os.path.join(args.save_dir, f"run_{run_idx}")
         os.makedirs(run_save_dir, exist_ok=True)
 
         # ── 对数据集做随机子采样 ──
         seed = 42 + run_idx
-        if args.num_runs > 1:
-            datasets = {}
-            for key, ds in datasets_full.items():
-                datasets[key] = subsample(
-                    ds, ratio=args.subsample_ratio, seed=seed,
-                    is_list=(key == "blink"),
-                )
-                print(f"  Run {run_idx+1}: {key} sampled "
-                      f"{len(datasets[key])}/{len(ds)} (seed={seed})")
-        else:
-            datasets = datasets_full
+        datasets = {}
+        for key, ds in datasets_full.items():
+            datasets[key] = subsample(
+                ds, ratio=args.subsample_ratio, seed=seed,
+                is_list=(key == "blink"),
+            )
+            print(f"  Run {run_idx+1}: {key} sampled "
+                  f"{len(datasets[key])}/{len(ds)} (seed={seed})")
 
         run_results = defaultdict(dict)
         model_labels_this_run = []
@@ -1109,43 +940,7 @@ def main():
             for bench, m in metrics.items():
                 run_results[bench][label] = m
 
-        # ── 2. Finetune Baseline ──
-        if run_ft_base:
-            label = "ft_baseline"
-            model_labels_this_run.append(label)
-            metrics = run_all_benchmarks_base(
-                ft_model, ft_proc, datasets, label, run_save_dir)
-            for bench, m in metrics.items():
-                run_results[bench][label] = m
-
-        # ── 3. No-PCS Ablation ──
-        if run_no_pcs:
-            label = "no_pcs"
-            model_labels_this_run.append(label)
-            metrics = run_all_benchmarks_enhanced(
-                no_pcs_model, datasets, label, run_save_dir)
-            for bench, m in metrics.items():
-                run_results[bench][label] = m
-
-        # ── 4. PCS-Only Ablation ──
-        if run_pcs_only:
-            label = "pcs_only"
-            model_labels_this_run.append(label)
-            metrics = run_all_benchmarks_enhanced(
-                pcs_only_model, datasets, label, run_save_dir)
-            for bench, m in metrics.items():
-                run_results[bench][label] = m
-
-        # ── 5. Random SAE Ablation ──
-        if run_random_sae:
-            label = "random_sae"
-            model_labels_this_run.append(label)
-            metrics = run_all_benchmarks_enhanced(
-                random_sae_model, datasets, label, run_save_dir)
-            for bench, m in metrics.items():
-                run_results[bench][label] = m
-
-        # ── 6. Enhanced (v1) ──
+        # ── 2. Enhanced ──
         if run_enhanced:
             label = "enhanced"
             model_labels_this_run.append(label)
@@ -1154,53 +949,35 @@ def main():
             for bench, m in metrics.items():
                 run_results[bench][label] = m
 
-        # ── 7. Spatial (v2) ──
-        if run_spatial:
-            label = "spatial"
-            model_labels_this_run.append(label)
-            metrics = run_all_benchmarks_enhanced(
-                spatial_model, datasets, label, run_save_dir)
-            for bench, m in metrics.items():
-                run_results[bench][label] = m
-
         all_runs_results.append(dict(run_results))
-        model_labels = model_labels_this_run  # 每次 run 的 label 相同
+        model_labels = model_labels_this_run
 
         # 单次打印
         if len(model_labels) >= 2:
             print_grand_summary(dict(run_results), model_labels)
 
     # ── 释放模型显存 ──
-    del base_model, processor, ft_model, ft_proc
-    del no_pcs_model, pcs_only_model, random_sae_model
-    del enhanced_model, spatial_model
+    del base_model, processor, enhanced_model
     torch.cuda.empty_cache()
 
     # ── 多次运行汇总 ──
-    if args.num_runs > 1:
-        aggregated = aggregate_multi_runs(all_runs_results, model_labels)
-        print_grand_summary_with_std(aggregated, model_labels)
+    aggregated = aggregate_multi_runs(all_runs_results, model_labels)
+    print_grand_summary_with_std(aggregated, model_labels)
 
-        # 保存汇总
-        summary = {
-            "config": {
-                "num_runs": args.num_runs,
-                "subsample_ratio": args.subsample_ratio,
-                "seeds": [42 + i for i in range(args.num_runs)],
-            },
-            "aggregated": aggregated,
-            "per_run": all_runs_results,
-        }
-        summary_path = os.path.join(args.save_dir, "summary_mean_std.json")
-        with open(summary_path, "w") as f:
-            json.dump(summary, f, indent=2)
-        print(f"\nDone. Aggregated summary (mean±std) saved to {summary_path}")
-    else:
-        summary = all_runs_results[0]
-        summary_path = os.path.join(args.save_dir, "summary.json")
-        with open(summary_path, "w") as f:
-            json.dump(summary, f, indent=2)
-        print(f"\nDone. Summary saved to {summary_path}")
+    summary = {
+        "config": {
+            "model_id": args.model_id,
+            "num_runs": args.num_runs,
+            "subsample_ratio": args.subsample_ratio,
+            "seeds": [42 + i for i in range(args.num_runs)],
+        },
+        "aggregated": aggregated,
+        "per_run": all_runs_results,
+    }
+    summary_path = os.path.join(args.save_dir, "summary_mean_std.json")
+    with open(summary_path, "w") as f:
+        json.dump(summary, f, indent=2)
+    print(f"\nDone. Aggregated summary (mean±std) saved to {summary_path}")
 
 
 if __name__ == "__main__":

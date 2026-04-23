@@ -5,7 +5,7 @@ Stage 1: 学 what to focus
   - 训练 ClusterPredictor + ImageClusterScorer
   - Hook 只读：预测 cluster，不修改 hidden
   - Loss = BCE + alignment
-  - 命令: python -m llava_next.train_focus_llava_next --stage 1
+  - 命令: python -m llava_next.train_focus_llava_next --stage 1 && python -m llava_next.train_focus_llava_next --stage 2 --resume best
 
 Stage 2: 学 how to inject
   - 训练 SemanticCrossAttention + ExtraProjector + top LM layers

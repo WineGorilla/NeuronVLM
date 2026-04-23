@@ -11,7 +11,7 @@
     }
 
 用法：
-    CUDA_VISIBLE_DEVICES=1 python scripts/build_cluster_data.py --layer 4 --max 5000 && CUDA_VISIBLE_DEVICES=1 python -m src.train_focus --stage 1 && CUDA_VISIBLE_DEVICES=1 python -m src.train_focus --stage 2 --resume best && CUDA_VISIBLE_DEVICES=1 python scripts/eval_all.py --mode enhanced --layer 4
+    CUDA_VISIBLE_DEVICES=1 python scripts/build_cluster_data.py --layer 8 --max 4410 && CUDA_VISIBLE_DEVICES=1 python -m src.train_focus --stage 1 && CUDA_VISIBLE_DEVICES=1 python -m src.train_focus --stage 2 --resume best && CUDA_VISIBLE_DEVICES=1 python scripts/eval_all.py --mode enhanced --layer 4
     python data/build_cluster_data.py --layer 8
 """
 import os
