@@ -5,17 +5,19 @@
 低于阈值的区域统一压成最低蓝色。
 
 用法：
-    python src/vv.py \
-        --image data/images/train2014/COCO_train2014_000000524522.jpg \
-        --question "Are all the players wearing black shirts?" \
-        --predictor_ckpt outputs/focus_ckpt_0.75_64_5000/predictor_best.pt --n_clusters 3
+    CUDA_VISIBLE_DEVICES=1 python src/v.py \
+        --image data/images/train2014/COCO_train2014_000000524291.jpg \
+        --question "What is in the person's hand?" \
+        --predictor_ckpt outputs/focus_ckpt_0.75_64_5000/predictor_best.pt --n_clusters 2
 
 
-    python src/vv.py \
+
+    python src/ab.py \
         --image data/images/train2014/COCO_train2014_000000132310.jpg \
         --question "How many people are wearing a red shirt?" \
         --predictor_ckpt outputs/qwen_layer8_old/focus_ckpt_0.75_64_5000/predictor_best.pt \
         --save_dir outputs/heatmaps --n_clusters 3
+
 
     python src/visualize_heatmap.py --image xxx.jpg --question "..." --n_clusters 3
     python src/visualize_heatmap.py --image xxx.jpg --question "..." --threshold 0.3
@@ -39,9 +41,12 @@ from src.Model import QwenWithClusterPredictorAndSAE
 
 
 plt.rcParams.update({
-    "font.family": "serif",
-    "font.serif": ["Times New Roman", "DejaVu Serif", "serif"],
     "font.size": 9,
+    "text.color": "black",
+    "axes.labelcolor": "black",
+    "axes.edgecolor": "black",
+    "xtick.color": "black",
+    "ytick.color": "black",
 })
 
 
@@ -168,7 +173,8 @@ class HeatmapVisualizer:
     def plot(self, original_image, n_clusters=3, threshold=0.3, alpha=0.45,
              save_path=None):
         """
-        原图 | Overall Focus | Neuron Cluster 1 | Neuron Cluster 2 | ...
+        原图 | Overall Focus | Neuron Cluster 1 | Neuron Cluster 3 | ...
+        （跳过排序后第 2 个 cluster）
         """
         if "total" not in self.sae_layer_data:
             print("  [warning] No data."); return
@@ -180,7 +186,13 @@ class HeatmapVisualizer:
         sorted_clusters = sorted(per_cluster.items(),
                                  key=lambda x: x[1].max(), reverse=True)
         n_show = min(n_clusters, len(sorted_clusters))
-        n_cols = 2 + n_show
+
+        # 跳过排序后第 2 个 cluster（index=1）
+        display_clusters = [(cid, acts) for j, (cid, acts)
+                            in enumerate(sorted_clusters[:n_show]) if j != 1]
+
+        n_display = len(display_clusters)
+        n_cols = 2 + n_display
 
         # 图尺寸
         panel_w = 3.2
@@ -194,32 +206,34 @@ class HeatmapVisualizer:
 
         # ── 原图（干净，不做处理）──
         axes[0].imshow(img)
-        axes[0].set_xlabel("Input Image", fontsize=9, labelpad=4)
+        axes[0].set_xlabel("Input Image", fontsize=16, labelpad=4)
         axes[0].set_xticks([]); axes[0].set_yticks([])
         for s in axes[0].spines.values():
-            s.set_linewidth(0.4); s.set_color("#999999")
+            s.set_linewidth(0.4); s.set_color("black")
 
-        # ── Overall Focus ──
-        total = self.sae_layer_data["total"]
-        hm = _reshape_to_grid(total, H, W)
+        # ── Overall Focus（只汇总实际显示的 clusters）──
+        shown_total = np.zeros_like(self.sae_layer_data["total"])
+        for _, acts in display_clusters:
+            shown_total += np.clip(acts, 0, None)
+        hm = _reshape_to_grid(shown_total, H, W)
         overlay = _render_overlay(img, hm, threshold=threshold, alpha=alpha)
         axes[1].imshow(overlay)
-        axes[1].set_xlabel("Overall Focus", fontsize=9, labelpad=4)
+        axes[1].set_xlabel("Overall Focus", fontsize=16, labelpad=4)
         axes[1].set_xticks([]); axes[1].set_yticks([])
         for s in axes[1].spines.values():
-            s.set_linewidth(0.4); s.set_color("#999999")
+            s.set_linewidth(0.4); s.set_color("black")
 
-        # ── Neuron Cluster 1, 2, 3... ──
-        for i, (cid, acts) in enumerate(sorted_clusters[:n_show]):
+        # ── Neuron Cluster panels ──
+        for i, (cid, acts) in enumerate(display_clusters):
             ax = axes[2 + i]
             acts_clip = np.clip(acts, 0, None)
             hm_c = _reshape_to_grid(acts_clip, H, W)
             overlay_c = _render_overlay(img, hm_c, threshold=threshold, alpha=alpha)
             ax.imshow(overlay_c)
-            ax.set_xlabel(f"Neuron Cluster {cid}", fontsize=9, labelpad=4)
+            ax.set_xlabel(f"Neuron Cluster {cid}", fontsize=16, labelpad=4)
             ax.set_xticks([]); ax.set_yticks([])
             for s in ax.spines.values():
-                s.set_linewidth(0.4); s.set_color("#999999")
+                s.set_linewidth(0.4); s.set_color("black")
 
         if save_path:
             fig.savefig(save_path, dpi=300, bbox_inches="tight", pad_inches=0.03,
@@ -245,7 +259,7 @@ def main():
     parser.add_argument("--max_tokens", type=int, default=64)
     parser.add_argument("--n_clusters", type=int, default=3,
                         help="展示 top-N 个 neuron cluster")
-    parser.add_argument("--threshold", type=float, default=0.5,
+    parser.add_argument("--threshold", type=float, default=0.3,
                         help="低于 max*threshold 的区域显示为蓝色 (0~1)")
     parser.add_argument("--alpha", type=float, default=0.45,
                         help="热图叠加透明度 (0=纯原图, 1=纯热图)")

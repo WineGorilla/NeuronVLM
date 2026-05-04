@@ -5,10 +5,19 @@
 低于阈值的区域统一压成最低蓝色。
 
 用法：
-    python src/v.py \
+    CUDA_VISIBLE_DEVICES=1 python src/v.py \
         --image data/images/train2014/COCO_train2014_000000524291.jpg \
         --question "What is in the person's hand?" \
         --predictor_ckpt outputs/focus_ckpt_0.75_64_5000/predictor_best.pt --n_clusters 2
+
+
+
+    python src/v.py \
+        --image data/images/train2014/COCO_train2014_000000132310.jpg \
+        --question "How many people are wearing a red shirt?" \
+        --predictor_ckpt outputs/qwen_layer8_old/focus_ckpt_0.75_64_5000/predictor_best.pt \
+        --save_dir outputs/heatmaps --n_clusters 3
+
 
     python src/visualize_heatmap.py --image xxx.jpg --question "..." --n_clusters 3
     python src/visualize_heatmap.py --image xxx.jpg --question "..." --threshold 0.3
@@ -243,7 +252,7 @@ def main():
     parser.add_argument("--max_tokens", type=int, default=64)
     parser.add_argument("--n_clusters", type=int, default=3,
                         help="展示 top-N 个 neuron cluster")
-    parser.add_argument("--threshold", type=float, default=0.3,
+    parser.add_argument("--threshold", type=float, default=0.5,
                         help="低于 max*threshold 的区域显示为蓝色 (0~1)")
     parser.add_argument("--alpha", type=float, default=0.45,
                         help="热图叠加透明度 (0=纯原图, 1=纯热图)")
